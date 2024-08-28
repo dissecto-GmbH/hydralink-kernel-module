@@ -62,12 +62,10 @@ static int bcm89881_config_aneg(struct phy_device *phydev)
 
 		switch (phydev->speed) {
 		case SPEED_100:
-			modify(phydev, 1, 0x0000, 0x0040, 0x2000);
-			modify(phydev, 1, 0x0834, 0x0000, 0x000f);
+			modify(phydev, 1, 0x0000, 0x2000, 0x0040);
 			break;
 		case SPEED_1000:
-			modify(phydev, 1, 0x0000, 0x2000, 0x0040);
-			modify(phydev, 1, 0x0834, 0x0001, 0x000e);
+			modify(phydev, 1, 0x0000, 0x0040, 0x2000);
 			break;
 		default:
 			return -EINVAL;
@@ -77,25 +75,33 @@ static int bcm89881_config_aneg(struct phy_device *phydev)
 		case MASTER_SLAVE_CFG_MASTER_PREFERRED:
 		case MASTER_SLAVE_CFG_MASTER_FORCE:
 			modify(phydev, 1, 0x0834, 0x4000, 0x0000);
+			phydev_warn(phydev, "Switched to master mode\n");
 			break;
 		case MASTER_SLAVE_CFG_SLAVE_FORCE:
 		case MASTER_SLAVE_CFG_SLAVE_PREFERRED:
 			modify(phydev, 1, 0x0834, 0x0000, 0x4000);
+			phydev_warn(phydev, "Switched to slave mode\n");
 			break;
 		case MASTER_SLAVE_CFG_UNKNOWN:
+			phydev_warn(phydev, "Unknown Master/Slave mode\n");
+			break;
+		case MASTER_SLAVE_CFG_UNSUPPORTED:
+			phydev_warn(phydev, "Unsupported Master/Slave mode\n");
 			break;
 		default:
-			phydev_warn(phydev, "Unsupported Master/Slave mode\n");
+			phydev_err(phydev, "Bad Master/Slave mode\n");
 			return -EOPNOTSUPP;
 		}
 
 		modify(phydev, 1, 0x0000, 0x0000, 0x8000);
 
 		phy_write_mmd(phydev, 1, 0xa010, 0x0001);
+		phy_write_mmd(phydev, 1, 0xa015, 0x0000);
 
 		// set leds
-		phy_write_mmd(phydev, 1, 0x931e, 0x0010);
-		phy_write_mmd(phydev, 1, 0x931d, 0x0063);
+		phy_write_mmd(phydev, 1, 0xa027, 0x0f15);
+		phy_write_mmd(phydev, 1, 0x931e, 0x0063);
+		phy_write_mmd(phydev, 1, 0x931d, 0x0010);
 	}
 	return 0;
 }

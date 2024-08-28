@@ -179,6 +179,11 @@
 #define INT_EP_GPIO_1 (1)
 #define INT_EP_GPIO_0 (0)
 
+/* Compatibility with kernels from before 2024 */
+#ifndef ethtool_keee
+#define ethtool_keee ethtool_eee
+#endif
+
 static const char lan78xx_gstrings[][ETH_GSTRING_LEN] = {
 	"RX FCS Errors",
 	"RX Alignment Errors",
