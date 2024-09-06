@@ -2130,7 +2130,6 @@ static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 
 	ret = __lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
 
-done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
 
@@ -2155,7 +2154,6 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | 1);
 	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
 
-done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
 	return 0;
@@ -2386,7 +2384,6 @@ static int ksz9031rnx_fixup(struct phy_device *phydev)
 static int bcm89881_fixup(struct phy_device *phydev)
 {
 	struct lan78xx_net *dev = netdev_priv(phydev->attached_dev);
-	int phy_id = 0;
 	u32 buf;
 	int ret;
 
@@ -4467,9 +4464,9 @@ static int lan7801_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	ret = lan78xx_read_reg(dev, GPIO_CFG1, &val);
 
 	// offset - 4 since gpio 4 is the first bit in the byte
-	int b = (_Bool)(val & (1 << (offset - 4)));
+	int b = (val & (1 << (offset - 4))) ? 1 : 0;
 
-	return 0;
+	return b;
 }
 
 static int lan7801_gpio_get_direction(struct gpio_chip *chip,
