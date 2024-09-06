@@ -28,8 +28,6 @@
 #include <linux/phy_fixed.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
-#include <linux/gpio/driver.h>
-#include <linux/spinlock.h>
 #include "lan78xx.h"
 
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
@@ -83,9 +81,6 @@
 
 #define	MII_READ			1
 #define	MII_WRITE			0
-
-#define MII_MAC_CR (0x100)
-#define MII_MAC_CFG_MASK (0x0006)
 
 #define EEPROM_INDICATOR		(0xA5)
 #define EEPROM_MAC_OFFSET		(0x01)
@@ -450,7 +445,6 @@ struct lan78xx_net {
 
 	struct mutex		dev_mutex; /* serialise open/stop wrt suspend/resume */
 	struct mutex		phy_mutex; /* for phy access */
-	struct mutex		gpio_lock; /* for gpio access */
 	unsigned int		pipe_in, pipe_out, pipe_intr;
 
 	unsigned int		bulk_in_delay;
@@ -1699,15 +1693,10 @@ static int lan78xx_get_eee(struct net_device *net, struct ethtool_keee *edata)
 
 	ret = lan78xx_read_reg(dev, MAC_CR, &buf);
 	if (buf & MAC_CR_EEE_EN_) {
-		edata->eee_enabled = true;
-		edata->tx_lpi_enabled = true;
 		/* EEE_TX_LPI_REQ_DLY & tx_lpi_timer are same uSec unit */
 		ret = lan78xx_read_reg(dev, EEE_TX_LPI_REQ_DLY, &buf);
 		edata->tx_lpi_timer = buf;
 	} else {
-		edata->eee_enabled = false;
-		edata->eee_active = false;
-		edata->tx_lpi_enabled = false;
 		edata->tx_lpi_timer = 0;
 	}
 
@@ -1728,24 +1717,16 @@ static int lan78xx_set_eee(struct net_device *net, struct ethtool_keee *edata)
 	if (ret < 0)
 		return ret;
 
-	if (edata->eee_enabled) {
-		ret = lan78xx_read_reg(dev, MAC_CR, &buf);
-		buf |= MAC_CR_EEE_EN_;
-		ret = lan78xx_write_reg(dev, MAC_CR, buf);
+	ret = phy_ethtool_set_eee(net->phydev, edata);
+	if (ret < 0)
+		goto out;
 
-		phy_ethtool_set_eee(net->phydev, edata);
-
-		buf = (u32)edata->tx_lpi_timer;
-		ret = lan78xx_write_reg(dev, EEE_TX_LPI_REQ_DLY, buf);
-	} else {
-		ret = lan78xx_read_reg(dev, MAC_CR, &buf);
-		buf &= ~MAC_CR_EEE_EN_;
-		ret = lan78xx_write_reg(dev, MAC_CR, buf);
-	}
-
+	buf = (u32)edata->tx_lpi_timer;
+	ret = lan78xx_write_reg(dev, EEE_TX_LPI_REQ_DLY, buf);
+out:
 	usb_autopm_put_interface(dev->intf);
 
-	return 0;
+	return ret;
 }
 
 static u32 lan78xx_get_link(struct net_device *net)
@@ -1808,7 +1789,6 @@ static int lan78xx_set_link_ksettings(struct net_device *net,
 	struct phy_device *phydev = net->phydev;
 	int ret = 0;
 	int temp;
-	int mac_cfg;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -1820,37 +1800,9 @@ static int lan78xx_set_link_ksettings(struct net_device *net,
 	if (!cmd->base.autoneg) {
 		/* force link down */
 		temp = phy_read(phydev, MII_BMCR);
-		phy_write(phydev, MII_BMCR, temp | 0x8000);
+		phy_write(phydev, MII_BMCR, temp | BMCR_LOOPBACK);
 		mdelay(1);
 		phy_write(phydev, MII_BMCR, temp);
-
-		if (dev->chipid == ID_REV_CHIP_ID_7801_ &&
-		    phydev->drv->phy_id == PHY_BCM89881) {
-			mac_cfg = 0;
-			// set speed
-			switch (cmd->base.speed) {
-			case 100:
-				mac_cfg = 1;
-				phydev->speed = 100;
-				break;
-			case 1000:
-				mac_cfg = 2;
-				phydev->speed = 1000;
-				break;
-			default:
-				netdev_warn(
-					net,
-					"The selected speed is not fully supported: %d\n",
-					cmd->base.speed);
-			}
-
-			if (mac_cfg > 0) {
-				ret = lan78xx_read_reg(dev, MII_MAC_CR, &temp);
-				temp &= ~MII_MAC_CFG_MASK;
-				temp |= (mac_cfg & 3) << 1;
-				ret = lan78xx_write_reg(dev, MII_MAC_CR, temp);
-			}
-		}
 	}
 
 	usb_autopm_put_interface(dev->intf);
@@ -2216,7 +2168,20 @@ static void lan78xx_remove_mdio(struct lan78xx_net *dev)
 
 static void lan78xx_link_status_change(struct net_device *net)
 {
+	struct lan78xx_net *dev = netdev_priv(net);
 	struct phy_device *phydev = net->phydev;
+	u32 data;
+	int ret;
+
+	ret = lan78xx_read_reg(dev, MAC_CR, &data);
+	if (ret < 0)
+		return;
+
+	if (phydev->enable_tx_lpi)
+		data |=  MAC_CR_EEE_EN_;
+	else
+		data &= ~MAC_CR_EEE_EN_;
+	lan78xx_write_reg(dev, MAC_CR, data);
 
 	phy_print_status(phydev);
 }
@@ -2549,6 +2514,8 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 	mii_adv = (u32)mii_advertise_flowctrl(dev->fc_request_control);
 	mii_adv_to_linkmode_adv_t(fc, mii_adv);
 	linkmode_or(phydev->advertising, fc, phydev->advertising);
+
+	phy_support_eee(phydev);
 
 	if (phydev->mdio.dev.of_node) {
 		u32 reg;
@@ -3178,6 +3145,8 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 	/* LAN7801 only has RGMII mode */
 	if (dev->chipid == ID_REV_CHIP_ID_7801_) {
 		buf &= ~MAC_CR_GMII_EN_;
+		/* Enable Auto Duplex and Auto speed */
+		buf |= MAC_CR_AUTO_DUPLEX_ | MAC_CR_AUTO_SPEED_;
 	}
 
 	if (dev->chipid == ID_REV_CHIP_ID_7800_ ||
@@ -4451,159 +4420,6 @@ static void lan78xx_stat_monitor(struct timer_list *t)
 	struct lan78xx_net *dev = from_timer(dev, t, stat_monitor);
 
 	lan78xx_defer_kevent(dev, EVENT_STAT_UPDATE);
-}
-
-static int lan7801_gpio_get(struct gpio_chip *chip, unsigned int offset)
-{
-	struct lan78xx_net *dev = gpiochip_get_data(chip);
-	u32 val, ret;
-
-	if (offset <= 3)
-		return -1;
-
-	ret = lan78xx_read_reg(dev, GPIO_CFG1, &val);
-
-	// offset - 4 since gpio 4 is the first bit in the byte
-	int b = (val & (1 << (offset - 4))) ? 1 : 0;
-
-	return b;
-}
-
-static int lan7801_gpio_get_direction(struct gpio_chip *chip,
-				      unsigned int offset)
-{
-	struct lan78xx_net *dev = gpiochip_get_data(chip);
-	u32 val, ret;
-
-	if (offset <= 3)
-		return -1;
-
-	ret = lan78xx_read_reg(dev, GPIO_CFG1, &val);
-
-	// offset - 4 since gpio 4 is the first bit in the direction byte
-	// and inverted, since lan7801 treats a set bit (1) as output and an cleared
-	// one as input, whereas a return value of 0 for get_direction corresponds to
-	// output and a 1 to input
-	int b;
-	if (val & (1 << (GPIO_CFG1_GPIODIR_OFFSET_ + offset - 4)))
-		b = GPIO_LINE_DIRECTION_OUT;
-	else
-		b = GPIO_LINE_DIRECTION_IN;
-
-	return b;
-}
-
-static int lan7801_gpio_direction_in(struct gpio_chip *chip,
-				     unsigned int offset)
-{
-	struct lan78xx_net *dev = gpiochip_get_data(chip);
-	u32 val;
-
-	mutex_lock(&dev->gpio_lock);
-	lan78xx_read_reg(dev, GPIO_CFG1, &val);
-	lan78xx_write_reg(dev, GPIO_CFG1,
-			  val & ~(1
-				  << (GPIO_CFG1_GPIODIR_OFFSET_ + offset - 4)));
-	mutex_unlock(&dev->gpio_lock);
-
-	return 0;
-}
-
-static int lan7801_gpio_set_bit(struct gpio_chip *chip, unsigned int offset,
-				int value)
-{
-	struct lan78xx_net *dev = gpiochip_get_data(chip);
-	u32 reg;
-
-	mutex_lock(&dev->gpio_lock);
-	lan78xx_read_reg(dev, GPIO_CFG1, &reg);
-
-	if (value) {
-		lan78xx_write_reg(dev, GPIO_CFG1, reg | (1 << offset));
-	} else {
-		lan78xx_write_reg(dev, GPIO_CFG1, reg & ~(1 << offset));
-	}
-	mutex_unlock(&dev->gpio_lock);
-
-	return 0;
-}
-
-static int lan7801_gpio_direction_out(struct gpio_chip *chip,
-				      unsigned int offset, int value)
-{
-	lan7801_gpio_set_bit(chip, GPIO_CFG1_GPIODIR_OFFSET_ + offset - 4,
-			     value);
-
-	return 0;
-}
-
-static void lan7801_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
-{
-	if (!lan7801_gpio_get_direction(chip, offset))
-		lan7801_gpio_set_bit(chip, offset - 4, value);
-}
-
-static int lan7801_gpio_set_config(struct gpio_chip *gc, unsigned int offset,
-				   unsigned long config)
-{
-	return 0;
-}
-
-static int lan7801_gpio_init(struct lan78xx_net *dev)
-{
-	struct gpio_chip *gc;
-	int ret;
-
-	mutex_init(&dev->gpio_lock);
-
-	gc = devm_kzalloc(&dev->intf->dev, sizeof(*gc), GFP_KERNEL);
-	if (!gc) {
-		dev_err(&dev->intf->dev,
-			"Error: Could not allocate gpio chip!\n");
-		return -ENOMEM;
-	}
-
-	gc->label = devm_kasprintf(&dev->intf->dev, GFP_KERNEL, "lan7801-gpio");
-
-	if (!gc->label) {
-		dev_err(&dev->intf->dev,
-			"Error: Could not allocate gpio chip label\n");
-		return -ENOMEM;
-	}
-
-	gc->base = -1;
-	gc->ngpio = 12;
-	gc->owner = THIS_MODULE;
-	gc->parent = &dev->intf->dev;
-	gc->can_sleep = true;
-	gc->get = lan7801_gpio_get;
-	gc->get_direction = lan7801_gpio_get_direction;
-	gc->direction_input = lan7801_gpio_direction_in;
-	gc->direction_output = lan7801_gpio_direction_out;
-	gc->set = lan7801_gpio_set;
-	gc->set_config = lan7801_gpio_set_config;
-
-	ret = devm_gpiochip_add_data(&dev->intf->dev, gc, dev);
-
-	if (ret)
-		return ret;
-
-	// enable gpio pins
-	lan78xx_write_reg(dev, GPIO_CFG1, 0);
-
-	return 0;
-}
-
-static int lan78xx_gpio_init(struct lan78xx_net *dev)
-{
-	switch (dev->chipid) {
-	case ID_REV_CHIP_ID_7801_:
-		return lan7801_gpio_init(dev);
-		break;
-	default:
-		netdev_err(dev->net, "Unknown CHIP ID found\n");
-		return -EIO;
-	}
 }
 
 static int lan78xx_probe(struct usb_interface *intf,
