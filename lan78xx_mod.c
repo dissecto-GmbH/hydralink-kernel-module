@@ -390,12 +390,6 @@ struct skb_data {		/* skb->cb is one of these */
 	int num_of_packet;
 };
 
-struct usb_context {
-	struct usb_ctrlrequest req;
-	struct lan78xx_net *dev;
-};
-
-
 #define EVENT_TX_HALT			0
 #define EVENT_RX_HALT			1
 #define EVENT_RX_MEMORY			2
@@ -1814,7 +1808,7 @@ static int lan78xx_set_link_ksettings(struct net_device *net,
 	struct phy_device *phydev = net->phydev;
 	int ret = 0;
 	int temp;
-	int buf;
+	int mac_cfg;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -1832,15 +1826,15 @@ static int lan78xx_set_link_ksettings(struct net_device *net,
 
 		if (dev->chipid == ID_REV_CHIP_ID_7801_ &&
 		    phydev->drv->phy_id == PHY_BCM89881) {
-			temp = 0;
+			mac_cfg = 0;
 			// set speed
 			switch (cmd->base.speed) {
 			case 100:
-				temp = 1;
+				mac_cfg = 1;
 				phydev->speed = 100;
 				break;
 			case 1000:
-				temp = 2;
+				mac_cfg = 2;
 				phydev->speed = 1000;
 				break;
 			default:
@@ -1850,11 +1844,11 @@ static int lan78xx_set_link_ksettings(struct net_device *net,
 					cmd->base.speed);
 			}
 
-			if (temp > 0) {
-				ret = lan78xx_read_reg(dev, MII_MAC_CR, &buf);
-				buf &= ~MII_MAC_CFG_MASK;
-				buf |= (temp & 3) << 1;
-				ret = lan78xx_write_reg(dev, MII_MAC_CR, buf);
+			if (mac_cfg > 0) {
+				ret = lan78xx_read_reg(dev, MII_MAC_CR, &temp);
+				temp &= ~MII_MAC_CFG_MASK;
+				temp |= (mac_cfg & 3) << 1;
+				ret = lan78xx_write_reg(dev, MII_MAC_CR, temp);
 			}
 		}
 	}
@@ -2079,7 +2073,8 @@ static int __lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 
 	return 0;
 }
-static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
+
+static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
 	int ret;
@@ -2092,14 +2087,13 @@ static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 
 	ret = __lan78xx_mdiobus_read(bus, phy_id, idx);
 
-done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
 
 	return ret;
 }
 
-static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
+static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
 				 u16 regval)
 {
 	struct lan78xx_net *dev = bus->priv;
@@ -2113,13 +2107,12 @@ static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 
 	ret = __lan78xx_mdiobus_write(bus, phy_id, idx, regval);
 
-done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
 	return 0;
 }
 
-static int lan78xx_mod_mdiobus_read_c45_over_c22(struct mii_bus *bus,
+static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 						 int phy_id, int devad, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
@@ -2144,7 +2137,7 @@ done:
 	return ret;
 }
 
-static int lan78xx_mod_mdiobus_write_c45_over_c22(struct mii_bus *bus,
+static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 						  int phy_id, int devad,
 						  int idx, u16 val)
 {
@@ -2180,10 +2173,10 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	}
 
 	dev->mdiobus->priv = (void *)dev;
-	dev->mdiobus->read = lan78xx_mdiobus_read;
-	dev->mdiobus->write = lan78xx_mdiobus_write;
-	dev->mdiobus->read_c45 = lan78xx_mod_mdiobus_read_c45_over_c22;
-	dev->mdiobus->write_c45 = lan78xx_mod_mdiobus_write_c45_over_c22;
+	dev->mdiobus->read = lan78xx_mdiobus_read_c22;
+	dev->mdiobus->write = lan78xx_mdiobus_write_c22;
+	dev->mdiobus->read_c45 = lan78xx_mdiobus_read_c45;
+	dev->mdiobus->write_c45 = lan78xx_mdiobus_write_c45;
 	dev->mdiobus->name = "lan78xx-mdiobus";
 	dev->mdiobus->parent = &dev->udev->dev;
 
@@ -2442,7 +2435,6 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 			netdev_err(dev->net, "No PHY/fixed_PHY found\n");
 			return NULL;
 		}
-		// phydev = phy_find_first(dev->mdiobus);
 		netdev_dbg(dev->net, "Registered FIXED PHY\n");
 		dev->interface = PHY_INTERFACE_MODE_RGMII;
 		ret = lan78xx_write_reg(dev, MAC_RGMII_ID,
@@ -2679,7 +2671,7 @@ static int lan78xx_change_mtu(struct net_device *netdev, int new_mtu)
 
 	ret = lan78xx_set_rx_max_frame_length(dev, max_frame_len);
 	if (!ret)
-		netdev->mtu = new_mtu;
+		WRITE_ONCE(netdev->mtu, new_mtu);
 
 	usb_autopm_put_interface(dev->intf);
 
@@ -3097,6 +3089,8 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 		return ret;
 
 	buf |= HW_CFG_MEF_;
+	buf |= HW_CFG_CLK125_EN_;
+	buf |= HW_CFG_REFCLK25_EN_;
 
 	ret = lan78xx_write_reg(dev, HW_CFG, buf);
 	if (ret < 0)
@@ -3185,8 +3179,9 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 		return ret;
 
 	/* LAN7801 only has RGMII mode */
-	if (dev->chipid == ID_REV_CHIP_ID_7801_)
+	if (dev->chipid == ID_REV_CHIP_ID_7801_) {
 		buf &= ~MAC_CR_GMII_EN_;
+	}
 
 	if (dev->chipid == ID_REV_CHIP_ID_7800_ ||
 	    dev->chipid == ID_REV_CHIP_ID_7850_) {
