@@ -1,183 +1,182 @@
-// SPDX-License-Identifint index, int *data)er: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2015 Microchip Technology
  */
-#include "lan78xx.h"
-#include <linux/crc32.h>
-#include <linux/etherdevice.h>
-#include <linux/ethtool.h>
-#include <linux/if_vlan.h>
-#include <linux/interrupt.h>
-#include <linux/ip.h>
-#include <linux/ipv6.h>
-#include <linux/irq.h>
-#include <linux/irqchip/chained_irq.h>
-#include <linux/irqdomain.h>
-#include <linux/linkmode.h>
-#include <linux/list.h>
-#include <linux/mdio.h>
-#include <linux/microchipphy.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
-#include <linux/of_mdio.h>
-#include <linux/of_net.h>
-#include <linux/phy.h>
-#include <linux/phy_fixed.h>
+#include <linux/etherdevice.h>
+#include <linux/ethtool.h>
+#include <linux/usb.h>
+#include <linux/crc32.h>
 #include <linux/signal.h>
 #include <linux/slab.h>
+#include <linux/if_vlan.h>
 #include <linux/uaccess.h>
-#include <linux/usb.h>
+#include <linux/linkmode.h>
+#include <linux/list.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/mdio.h>
+#include <linux/phy.h>
 #include <net/ip6_checksum.h>
 #include <net/vxlan.h>
-
+#include <linux/interrupt.h>
+#include <linux/irqdomain.h>
+#include <linux/irq.h>
+#include <linux/irqchip/chained_irq.h>
+#include <linux/microchipphy.h>
+#include <linux/phy_fixed.h>
+#include <linux/of_mdio.h>
+#include <linux/of_net.h>
 #include <linux/gpio/driver.h>
 #include <linux/spinlock.h>
+#include "lan78xx.h"
 
-#define DRIVER_AUTHOR "WOOJUNG HUH <woojung.huh@microchip.com>"
-#define DRIVER_DESC "LAN78XX USB 3.0 Gigabit Ethernet Devices"
-#define DRIVER_NAME "lan78xx"
+#define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
+#define DRIVER_DESC	"LAN78XX USB 3.0 Gigabit Ethernet Devices"
+#define DRIVER_NAME	"lan78xx"
 
-#define TX_TIMEOUT_JIFFIES (5 * HZ)
-#define THROTTLE_JIFFIES (HZ / 8)
-#define UNLINK_TIMEOUT_MS 3
+#define TX_TIMEOUT_JIFFIES		(5 * HZ)
+#define THROTTLE_JIFFIES		(HZ / 8)
+#define UNLINK_TIMEOUT_MS		3
 
-#define RX_MAX_QUEUE_MEMORY (60 * 1518)
+#define RX_MAX_QUEUE_MEMORY		(60 * 1518)
 
-#define SS_USB_PKT_SIZE (1024)
-#define HS_USB_PKT_SIZE (512)
-#define FS_USB_PKT_SIZE (64)
+#define SS_USB_PKT_SIZE			(1024)
+#define HS_USB_PKT_SIZE			(512)
+#define FS_USB_PKT_SIZE			(64)
 
-#define MAX_RX_FIFO_SIZE (12 * 1024)
-#define MAX_TX_FIFO_SIZE (12 * 1024)
+#define MAX_RX_FIFO_SIZE		(12 * 1024)
+#define MAX_TX_FIFO_SIZE		(12 * 1024)
 
-#define FLOW_THRESHOLD(n) ((((n) + 511) / 512) & 0x7F)
-#define FLOW_CTRL_THRESHOLD(on, off) \
-	((FLOW_THRESHOLD(on) << 0) | (FLOW_THRESHOLD(off) << 8))
+#define FLOW_THRESHOLD(n)		((((n) + 511) / 512) & 0x7F)
+#define FLOW_CTRL_THRESHOLD(on, off)	((FLOW_THRESHOLD(on)  << 0) | \
+					 (FLOW_THRESHOLD(off) << 8))
 
 /* Flow control turned on when Rx FIFO level rises above this level (bytes) */
-#define FLOW_ON_SS 9216
-#define FLOW_ON_HS 8704
+#define FLOW_ON_SS			9216
+#define FLOW_ON_HS			8704
 
 /* Flow control turned off when Rx FIFO level falls below this level (bytes) */
-#define FLOW_OFF_SS 4096
-#define FLOW_OFF_HS 1024
+#define FLOW_OFF_SS			4096
+#define FLOW_OFF_HS			1024
 
-#define DEFAULT_BURST_CAP_SIZE (MAX_TX_FIFO_SIZE)
-#define DEFAULT_BULK_IN_DELAY (0x0800)
-#define MAX_SINGLE_PACKET_SIZE (9000)
-#define DEFAULT_TX_CSUM_ENABLE (true)
-#define DEFAULT_RX_CSUM_ENABLE (true)
-#define DEFAULT_TSO_CSUM_ENABLE (true)
-#define DEFAULT_VLAN_FILTER_ENABLE (true)
-#define DEFAULT_VLAN_RX_OFFLOAD (true)
-#define TX_ALIGNMENT (4)
-#define RXW_PADDING 2
+#define DEFAULT_BURST_CAP_SIZE		(MAX_TX_FIFO_SIZE)
+#define DEFAULT_BULK_IN_DELAY		(0x0800)
+#define MAX_SINGLE_PACKET_SIZE		(9000)
+#define DEFAULT_TX_CSUM_ENABLE		(true)
+#define DEFAULT_RX_CSUM_ENABLE		(true)
+#define DEFAULT_TSO_CSUM_ENABLE		(true)
+#define DEFAULT_VLAN_FILTER_ENABLE	(true)
+#define DEFAULT_VLAN_RX_OFFLOAD		(true)
+#define TX_ALIGNMENT			(4)
+#define RXW_PADDING			2
 
-#define LAN78XX_USB_VENDOR_ID (0x0424)
-#define LAN7800_USB_PRODUCT_ID (0x7800)
-#define LAN7850_USB_PRODUCT_ID (0x7850)
-#define LAN7801_USB_PRODUCT_ID (0x7801)
-#define LAN78XX_EEPROM_MAGIC (0x78A5)
-#define LAN78XX_OTP_MAGIC (0x78F3)
-#define AT29M2AF_USB_VENDOR_ID (0x07C9)
-#define AT29M2AF_USB_PRODUCT_ID (0x0012)
+#define LAN78XX_USB_VENDOR_ID		(0x0424)
+#define LAN7800_USB_PRODUCT_ID		(0x7800)
+#define LAN7850_USB_PRODUCT_ID		(0x7850)
+#define LAN7801_USB_PRODUCT_ID		(0x7801)
+#define LAN78XX_EEPROM_MAGIC		(0x78A5)
+#define LAN78XX_OTP_MAGIC		(0x78F3)
+#define AT29M2AF_USB_VENDOR_ID		(0x07C9)
+#define AT29M2AF_USB_PRODUCT_ID	(0x0012)
 
-#define MII_READ 1
-#define MII_WRITE 0
+#define	MII_READ			1
+#define	MII_WRITE			0
 
 #define MII_MAC_CR (0x100)
 #define MII_MAC_CFG_MASK (0x0006)
 
-#define EEPROM_INDICATOR (0xA5)
-#define EEPROM_MAC_OFFSET (0x01)
-#define MAX_EEPROM_SIZE 512
-#define OTP_INDICATOR_1 (0xF3)
-#define OTP_INDICATOR_2 (0xF7)
+#define EEPROM_INDICATOR		(0xA5)
+#define EEPROM_MAC_OFFSET		(0x01)
+#define MAX_EEPROM_SIZE			512
+#define OTP_INDICATOR_1			(0xF3)
+#define OTP_INDICATOR_2			(0xF7)
 
-#define WAKE_ALL                                                      \
-	(WAKE_PHY | WAKE_UCAST | WAKE_MCAST | WAKE_BCAST | WAKE_ARP | \
-	 WAKE_MAGIC)
+#define WAKE_ALL			(WAKE_PHY | WAKE_UCAST | \
+					 WAKE_MCAST | WAKE_BCAST | \
+					 WAKE_ARP | WAKE_MAGIC)
 
-#define TX_URB_NUM 10
-#define TX_SS_URB_NUM TX_URB_NUM
-#define TX_HS_URB_NUM TX_URB_NUM
-#define TX_FS_URB_NUM TX_URB_NUM
+#define TX_URB_NUM			10
+#define TX_SS_URB_NUM			TX_URB_NUM
+#define TX_HS_URB_NUM			TX_URB_NUM
+#define TX_FS_URB_NUM			TX_URB_NUM
 
 /* A single URB buffer must be large enough to hold a complete jumbo packet
  */
-#define TX_SS_URB_SIZE (32 * 1024)
-#define TX_HS_URB_SIZE (16 * 1024)
-#define TX_FS_URB_SIZE (10 * 1024)
+#define TX_SS_URB_SIZE			(32 * 1024)
+#define TX_HS_URB_SIZE			(16 * 1024)
+#define TX_FS_URB_SIZE			(10 * 1024)
 
-#define RX_SS_URB_NUM 30
-#define RX_HS_URB_NUM 10
-#define RX_FS_URB_NUM 10
-#define RX_SS_URB_SIZE TX_SS_URB_SIZE
-#define RX_HS_URB_SIZE TX_HS_URB_SIZE
-#define RX_FS_URB_SIZE TX_FS_URB_SIZE
+#define RX_SS_URB_NUM			30
+#define RX_HS_URB_NUM			10
+#define RX_FS_URB_NUM			10
+#define RX_SS_URB_SIZE			TX_SS_URB_SIZE
+#define RX_HS_URB_SIZE			TX_HS_URB_SIZE
+#define RX_FS_URB_SIZE			TX_FS_URB_SIZE
 
-#define SS_BURST_CAP_SIZE RX_SS_URB_SIZE
-#define SS_BULK_IN_DELAY 0x2000
-#define HS_BURST_CAP_SIZE RX_HS_URB_SIZE
-#define HS_BULK_IN_DELAY 0x2000
-#define FS_BURST_CAP_SIZE RX_FS_URB_SIZE
-#define FS_BULK_IN_DELAY 0x2000
+#define SS_BURST_CAP_SIZE		RX_SS_URB_SIZE
+#define SS_BULK_IN_DELAY		0x2000
+#define HS_BURST_CAP_SIZE		RX_HS_URB_SIZE
+#define HS_BULK_IN_DELAY		0x2000
+#define FS_BURST_CAP_SIZE		RX_FS_URB_SIZE
+#define FS_BULK_IN_DELAY		0x2000
 
-#define TX_CMD_LEN 8
-#define TX_SKB_MIN_LEN (TX_CMD_LEN + ETH_HLEN)
-#define LAN78XX_TSO_SIZE(dev) ((dev)->tx_urb_size - TX_SKB_MIN_LEN)
+#define TX_CMD_LEN			8
+#define TX_SKB_MIN_LEN			(TX_CMD_LEN + ETH_HLEN)
+#define LAN78XX_TSO_SIZE(dev)		((dev)->tx_urb_size - TX_SKB_MIN_LEN)
 
-#define RX_CMD_LEN 10
-#define RX_SKB_MIN_LEN (RX_CMD_LEN + ETH_HLEN)
-#define RX_MAX_FRAME_LEN(mtu) ((mtu) + ETH_HLEN + VLAN_HLEN)
+#define RX_CMD_LEN			10
+#define RX_SKB_MIN_LEN			(RX_CMD_LEN + ETH_HLEN)
+#define RX_MAX_FRAME_LEN(mtu)		((mtu) + ETH_HLEN + VLAN_HLEN)
 
 /* USB related defines */
-#define BULK_IN_PIPE 1
-#define BULK_OUT_PIPE 2
+#define BULK_IN_PIPE			1
+#define BULK_OUT_PIPE			2
 
 /* default autosuspend delay (mSec)*/
-#define DEFAULT_AUTOSUSPEND_DELAY (10 * 1000)
+#define DEFAULT_AUTOSUSPEND_DELAY	(10 * 1000)
 
 /* statistic update interval (mSec) */
-#define STAT_UPDATE_TIMER (1 * 1000)
+#define STAT_UPDATE_TIMER		(1 * 1000)
 
 /* time to wait for MAC or FCT to stop (jiffies) */
-#define HW_DISABLE_TIMEOUT (HZ / 10)
+#define HW_DISABLE_TIMEOUT		(HZ / 10)
 
 /* time to wait between polling MAC or FCT state (ms) */
-#define HW_DISABLE_DELAY_MS 1
+#define HW_DISABLE_DELAY_MS		1
 
 /* defines interrupts from interrupt EP */
-#define MAX_INT_EP (32)
-#define INT_EP_INTEP (31)
-#define INT_EP_OTP_WR_DONE (28)
-#define INT_EP_EEE_TX_LPI_START (26)
-#define INT_EP_EEE_TX_LPI_STOP (25)
-#define INT_EP_EEE_RX_LPI (24)
-#define INT_EP_MAC_RESET_TIMEOUT (23)
-#define INT_EP_RDFO (22)
-#define INT_EP_TXE (21)
-#define INT_EP_USB_STATUS (20)
-#define INT_EP_TX_DIS (19)
-#define INT_EP_RX_DIS (18)
-#define INT_EP_PHY (17)
-#define INT_EP_DP (16)
-#define INT_EP_MAC_ERR (15)
-#define INT_EP_TDFU (14)
-#define INT_EP_TDFO (13)
-#define INT_EP_UTX (12)
-#define INT_EP_GPIO_11 (11)
-#define INT_EP_GPIO_10 (10)
-#define INT_EP_GPIO_9 (9)
-#define INT_EP_GPIO_8 (8)
-#define INT_EP_GPIO_7 (7)
-#define INT_EP_GPIO_6 (6)
-#define INT_EP_GPIO_5 (5)
-#define INT_EP_GPIO_4 (4)
-#define INT_EP_GPIO_3 (3)
-#define INT_EP_GPIO_2 (2)
-#define INT_EP_GPIO_1 (1)
-#define INT_EP_GPIO_0 (0)
+#define MAX_INT_EP			(32)
+#define INT_EP_INTEP			(31)
+#define INT_EP_OTP_WR_DONE		(28)
+#define INT_EP_EEE_TX_LPI_START		(26)
+#define INT_EP_EEE_TX_LPI_STOP		(25)
+#define INT_EP_EEE_RX_LPI		(24)
+#define INT_EP_MAC_RESET_TIMEOUT	(23)
+#define INT_EP_RDFO			(22)
+#define INT_EP_TXE			(21)
+#define INT_EP_USB_STATUS		(20)
+#define INT_EP_TX_DIS			(19)
+#define INT_EP_RX_DIS			(18)
+#define INT_EP_PHY			(17)
+#define INT_EP_DP			(16)
+#define INT_EP_MAC_ERR			(15)
+#define INT_EP_TDFU			(14)
+#define INT_EP_TDFO			(13)
+#define INT_EP_UTX			(12)
+#define INT_EP_GPIO_11			(11)
+#define INT_EP_GPIO_10			(10)
+#define INT_EP_GPIO_9			(9)
+#define INT_EP_GPIO_8			(8)
+#define INT_EP_GPIO_7			(7)
+#define INT_EP_GPIO_6			(6)
+#define INT_EP_GPIO_5			(5)
+#define INT_EP_GPIO_4			(4)
+#define INT_EP_GPIO_3			(3)
+#define INT_EP_GPIO_2			(2)
+#define INT_EP_GPIO_1			(1)
+#define INT_EP_GPIO_0			(0)
 
 /* Compatibility with kernels from before 2024 */
 #ifndef ethtool_keee
@@ -334,16 +333,27 @@ struct lan78xx_statstage64 {
 	u64 eee_tx_lpi_time;
 };
 
-static u32 lan78xx_regs[] = { ID_REV,	     INT_STS,
-			      HW_CFG,	     PMT_CTL,
-			      E2P_CMD,	     E2P_DATA,
-			      USB_STATUS,    VLAN_TYPE,
-			      MAC_CR,	     MAC_RX,
-			      MAC_TX,	     FLOW,
-			      ERR_STS,	     MII_ACC,
-			      MII_DATA,	     EEE_TX_LPI_REQ_DLY,
-			      EEE_TW_TX_SYS, EEE_TX_LPI_REM_DLY,
-			      WUCSR };
+static u32 lan78xx_regs[] = {
+	ID_REV,
+	INT_STS,
+	HW_CFG,
+	PMT_CTL,
+	E2P_CMD,
+	E2P_DATA,
+	USB_STATUS,
+	VLAN_TYPE,
+	MAC_CR,
+	MAC_RX,
+	MAC_TX,
+	FLOW,
+	ERR_STS,
+	MII_ACC,
+	MII_DATA,
+	EEE_TX_LPI_REQ_DLY,
+	EEE_TW_TX_SYS,
+	EEE_TX_LPI_REM_DLY,
+	WUCSR
+};
 
 #define PHY_REG_SIZE (32 * sizeof(u32))
 
@@ -372,7 +382,7 @@ enum skb_state {
 	unlink_start
 };
 
-struct skb_data { /* skb->cb is one of these */
+struct skb_data {		/* skb->cb is one of these */
 	struct urb *urb;
 	struct lan78xx_net *dev;
 	enum skb_state state;
@@ -385,103 +395,104 @@ struct usb_context {
 	struct lan78xx_net *dev;
 };
 
-#define EVENT_TX_HALT 0
-#define EVENT_RX_HALT 1
-#define EVENT_RX_MEMORY 2
-#define EVENT_STS_SPLIT 3
-#define EVENT_LINK_RESET 4
-#define EVENT_RX_PAUSED 5
-#define EVENT_DEV_WAKING 6
-#define EVENT_DEV_ASLEEP 7
-#define EVENT_DEV_OPEN 8
-#define EVENT_STAT_UPDATE 9
-#define EVENT_DEV_DISCONNECT 10
+
+#define EVENT_TX_HALT			0
+#define EVENT_RX_HALT			1
+#define EVENT_RX_MEMORY			2
+#define EVENT_STS_SPLIT			3
+#define EVENT_LINK_RESET		4
+#define EVENT_RX_PAUSED			5
+#define EVENT_DEV_WAKING		6
+#define EVENT_DEV_ASLEEP		7
+#define EVENT_DEV_OPEN			8
+#define EVENT_STAT_UPDATE		9
+#define EVENT_DEV_DISCONNECT		10
 
 struct statstage {
-	struct mutex access_lock; /* for stats access */
-	struct lan78xx_statstage saved;
-	struct lan78xx_statstage rollover_count;
-	struct lan78xx_statstage rollover_max;
-	struct lan78xx_statstage64 curr_stat;
+	struct mutex			access_lock;	/* for stats access */
+	struct lan78xx_statstage	saved;
+	struct lan78xx_statstage	rollover_count;
+	struct lan78xx_statstage	rollover_max;
+	struct lan78xx_statstage64	curr_stat;
 };
 
 struct irq_domain_data {
-	struct irq_domain *irqdomain;
-	unsigned int phyirq;
-	struct irq_chip *irqchip;
-	irq_flow_handler_t irq_handler;
-	u32 irqenable;
-	struct mutex irq_lock; /* for irq bus access */
+	struct irq_domain	*irqdomain;
+	unsigned int		phyirq;
+	struct irq_chip		*irqchip;
+	irq_flow_handler_t	irq_handler;
+	u32			irqenable;
+	struct mutex		irq_lock;		/* for irq bus access */
 };
 
 struct lan78xx_net {
-	struct net_device *net;
-	struct usb_device *udev;
-	struct usb_interface *intf;
-	void *driver_priv;
+	struct net_device	*net;
+	struct usb_device	*udev;
+	struct usb_interface	*intf;
+	void			*driver_priv;
 
-	unsigned int tx_pend_data_len;
-	size_t n_tx_urbs;
-	size_t n_rx_urbs;
-	size_t tx_urb_size;
-	size_t rx_urb_size;
+	unsigned int		tx_pend_data_len;
+	size_t			n_tx_urbs;
+	size_t			n_rx_urbs;
+	size_t			tx_urb_size;
+	size_t			rx_urb_size;
 
-	struct sk_buff_head rxq_free;
-	struct sk_buff_head rxq;
-	struct sk_buff_head rxq_done;
-	struct sk_buff_head rxq_overflow;
-	struct sk_buff_head txq_free;
-	struct sk_buff_head txq;
-	struct sk_buff_head txq_pend;
+	struct sk_buff_head	rxq_free;
+	struct sk_buff_head	rxq;
+	struct sk_buff_head	rxq_done;
+	struct sk_buff_head	rxq_overflow;
+	struct sk_buff_head	txq_free;
+	struct sk_buff_head	txq;
+	struct sk_buff_head	txq_pend;
 
-	struct napi_struct napi;
+	struct napi_struct	napi;
 
-	struct delayed_work wq;
+	struct delayed_work	wq;
 
-	int msg_enable;
+	int			msg_enable;
 
-	struct urb *urb_intr;
-	struct usb_anchor deferred;
+	struct urb		*urb_intr;
+	struct usb_anchor	deferred;
 
-	struct mutex dev_mutex; /* serialise open/stop wrt suspend/resume */
-	struct mutex phy_mutex; /* for phy access */
-	struct mutex gpio_lock; /* for gpio access */
-	unsigned int pipe_in, pipe_out, pipe_intr;
+	struct mutex		dev_mutex; /* serialise open/stop wrt suspend/resume */
+	struct mutex		phy_mutex; /* for phy access */
+	struct mutex		gpio_lock; /* for gpio access */
+	unsigned int		pipe_in, pipe_out, pipe_intr;
 
-	unsigned int bulk_in_delay;
-	unsigned int burst_cap;
+	unsigned int		bulk_in_delay;
+	unsigned int		burst_cap;
 
-	unsigned long flags;
+	unsigned long		flags;
 
-	wait_queue_head_t *wait;
-	unsigned char suspend_count;
+	wait_queue_head_t	*wait;
+	unsigned char		suspend_count;
 
-	unsigned int maxpacket;
-	struct timer_list stat_monitor;
+	unsigned int		maxpacket;
+	struct timer_list	stat_monitor;
 
-	unsigned long data[5];
+	unsigned long		data[5];
 
-	int link_on;
-	u8 mdix_ctrl;
+	int			link_on;
+	u8			mdix_ctrl;
 
-	u32 chipid;
-	u32 chiprev;
-	struct mii_bus *mdiobus;
-	phy_interface_t interface;
+	u32			chipid;
+	u32			chiprev;
+	struct mii_bus		*mdiobus;
+	phy_interface_t		interface;
 
-	int fc_autoneg;
-	u8 fc_request_control;
+	int			fc_autoneg;
+	u8			fc_request_control;
 
-	int delta;
-	struct statstage stats;
+	int			delta;
+	struct statstage	stats;
 
-	struct irq_domain_data domain_data;
+	struct irq_domain_data	domain_data;
 };
 
 /* define external phy id */
-#define PHY_LAN8835 (0x0007C130)
-#define PHY_KSZ9031RNX (0x00221620)
-#define PHY_BCM89881 (0xae025032)
+#define	PHY_LAN8835			(0x0007C130)
+#define	PHY_KSZ9031RNX			(0x00221620)
+#define PHY_BCM89881			(0xae025032)
 
 /* use ethtool to change the level for any given device */
 static int msg_level = -1;
@@ -523,8 +534,9 @@ static void lan78xx_free_buf_pool(struct sk_buff_head *buf_pool)
 	}
 }
 
-static int lan78xx_alloc_buf_pool(struct sk_buff_head *buf_pool, size_t n_urbs,
-				  size_t urb_size, struct lan78xx_net *dev)
+static int lan78xx_alloc_buf_pool(struct sk_buff_head *buf_pool,
+				  size_t n_urbs, size_t urb_size,
+				  struct lan78xx_net *dev)
 {
 	struct skb_data *entry;
 	struct sk_buff *buf;
@@ -584,8 +596,8 @@ static void lan78xx_free_rx_resources(struct lan78xx_net *dev)
 
 static int lan78xx_alloc_rx_resources(struct lan78xx_net *dev)
 {
-	return lan78xx_alloc_buf_pool(&dev->rxq_free, dev->n_rx_urbs,
-				      dev->rx_urb_size, dev);
+	return lan78xx_alloc_buf_pool(&dev->rxq_free,
+				      dev->n_rx_urbs, dev->rx_urb_size, dev);
 }
 
 static struct sk_buff *lan78xx_get_tx_buf(struct lan78xx_net *dev)
@@ -606,8 +618,8 @@ static void lan78xx_free_tx_resources(struct lan78xx_net *dev)
 
 static int lan78xx_alloc_tx_resources(struct lan78xx_net *dev)
 {
-	return lan78xx_alloc_buf_pool(&dev->txq_free, dev->n_tx_urbs,
-				      dev->tx_urb_size, dev);
+	return lan78xx_alloc_buf_pool(&dev->txq_free,
+				      dev->n_tx_urbs, dev->tx_urb_size, dev);
 }
 
 static int lan78xx_read_reg(struct lan78xx_net *dev, u32 index, u32 *data)
@@ -659,7 +671,8 @@ static int lan78xx_write_reg(struct lan78xx_net *dev, u32 index, u32 data)
 			      USB_VENDOR_REQUEST_WRITE_REGISTER,
 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
 			      0, index, buf, 4, USB_CTRL_SET_TIMEOUT);
-	if (unlikely(ret < 0) && net_ratelimit()) {
+	if (unlikely(ret < 0) &&
+	    net_ratelimit()) {
 		netdev_warn(dev->net,
 			    "Failed to write register index 0x%08x. ret = %d",
 			    index, ret);
@@ -703,10 +716,14 @@ static int lan78xx_read_stats(struct lan78xx_net *dev,
 	if (!stats)
 		return -ENOMEM;
 
-	ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+	ret = usb_control_msg(dev->udev,
+			      usb_rcvctrlpipe(dev->udev, 0),
 			      USB_VENDOR_REQUEST_GET_STATS,
 			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      0, 0, (void *)stats, sizeof(*stats),
+			      0,
+			      0,
+			      (void *)stats,
+			      sizeof(*stats),
 			      USB_CTRL_SET_TIMEOUT);
 	if (likely(ret >= 0)) {
 		src = (u32 *)stats;
@@ -716,7 +733,8 @@ static int lan78xx_read_stats(struct lan78xx_net *dev,
 			dst[i] = src[i];
 		}
 	} else {
-		netdev_warn(dev->net, "Failed to read stat ret = %d", ret);
+		netdev_warn(dev->net,
+			    "Failed to read stat ret = %d", ret);
 	}
 
 	kfree(stats);
@@ -724,10 +742,10 @@ static int lan78xx_read_stats(struct lan78xx_net *dev,
 	return ret;
 }
 
-#define check_counter_rollover(struct1, dev_stats, member)        \
-	do {                                                      \
-		if ((struct1)->member < (dev_stats).saved.member) \
-			(dev_stats).rollover_count.member++;      \
+#define check_counter_rollover(struct1, dev_stats, member)		\
+	do {								\
+		if ((struct1)->member < (dev_stats).saved.member)	\
+			(dev_stats).rollover_count.member++;		\
 	} while (0)
 
 static void lan78xx_check_stat_rollover(struct lan78xx_net *dev,
@@ -857,7 +875,8 @@ static int lan78xx_wait_eeprom(struct lan78xx_net *dev)
 		if (unlikely(ret < 0))
 			return -EIO;
 
-		if (!(val & E2P_CMD_EPC_BUSY_) || (val & E2P_CMD_EPC_TIMEOUT_))
+		if (!(val & E2P_CMD_EPC_BUSY_) ||
+		    (val & E2P_CMD_EPC_TIMEOUT_))
 			break;
 		usleep_range(40, 100);
 	} while (!time_after(jiffies, start_time + HZ));
@@ -900,8 +919,8 @@ static int lan78xx_read_raw_eeprom(struct lan78xx_net *dev, u32 offset,
 	int retval;
 
 	/* depends on chip, some EEPROM pins are muxed with LED function.
-   * disable & restore LED function to access EEPROM.
-   */
+	 * disable & restore LED function to access EEPROM.
+	 */
 	ret = lan78xx_read_reg(dev, HW_CFG, &val);
 	saved = val;
 	if (dev->chipid == ID_REV_CHIP_ID_7800_) {
@@ -944,8 +963,8 @@ exit:
 	return retval;
 }
 
-static int lan78xx_read_eeprom(struct lan78xx_net *dev, u32 offset, u32 length,
-			       u8 *data)
+static int lan78xx_read_eeprom(struct lan78xx_net *dev, u32 offset,
+			       u32 length, u8 *data)
 {
 	u8 sig;
 	int ret;
@@ -968,8 +987,8 @@ static int lan78xx_write_raw_eeprom(struct lan78xx_net *dev, u32 offset,
 	int retval;
 
 	/* depends on chip, some EEPROM pins are muxed with LED function.
-   * disable & restore LED function to access EEPROM.
-   */
+	 * disable & restore LED function to access EEPROM.
+	 */
 	ret = lan78xx_read_reg(dev, HW_CFG, &val);
 	saved = val;
 	if (dev->chipid == ID_REV_CHIP_ID_7800_) {
@@ -1026,8 +1045,8 @@ exit:
 	return retval;
 }
 
-static int lan78xx_read_raw_otp(struct lan78xx_net *dev, u32 offset, u32 length,
-				u8 *data)
+static int lan78xx_read_raw_otp(struct lan78xx_net *dev, u32 offset,
+				u32 length, u8 *data)
 {
 	int i;
 	u32 buf;
@@ -1044,7 +1063,8 @@ static int lan78xx_read_raw_otp(struct lan78xx_net *dev, u32 offset, u32 length,
 			usleep_range(1, 10);
 			lan78xx_read_reg(dev, OTP_PWR_DN, &buf);
 			if (time_after(jiffies, timeout)) {
-				netdev_warn(dev->net, "timeout on OTP_PWR_DN");
+				netdev_warn(dev->net,
+					    "timeout on OTP_PWR_DN");
 				return -EIO;
 			}
 		} while (buf & OTP_PWR_DN_PWRDN_N_);
@@ -1064,7 +1084,8 @@ static int lan78xx_read_raw_otp(struct lan78xx_net *dev, u32 offset, u32 length,
 			udelay(1);
 			lan78xx_read_reg(dev, OTP_STATUS, &buf);
 			if (time_after(jiffies, timeout)) {
-				netdev_warn(dev->net, "timeout on OTP_STATUS");
+				netdev_warn(dev->net,
+					    "timeout on OTP_STATUS");
 				return -EIO;
 			}
 		} while (buf & OTP_STATUS_BUSY_);
@@ -1129,8 +1150,8 @@ static int lan78xx_write_raw_otp(struct lan78xx_net *dev, u32 offset,
 	return 0;
 }
 
-static int lan78xx_read_otp(struct lan78xx_net *dev, u32 offset, u32 length,
-			    u8 *data)
+static int lan78xx_read_otp(struct lan78xx_net *dev, u32 offset,
+			    u32 length, u8 *data)
 {
 	u8 sig;
 	int ret;
@@ -1212,8 +1233,8 @@ done:
 	return ret;
 }
 
-static void lan78xx_set_addr_filter(struct lan78xx_priv *pdata, int index,
-				    u8 addr[ETH_ALEN])
+static void lan78xx_set_addr_filter(struct lan78xx_priv *pdata,
+				    int index, u8 addr[ETH_ALEN])
 {
 	u32 temp;
 
@@ -1239,7 +1260,7 @@ static inline u32 lan78xx_hash(char addr[ETH_ALEN])
 static void lan78xx_deferred_multicast_write(struct work_struct *param)
 {
 	struct lan78xx_priv *pdata =
-		container_of(param, struct lan78xx_priv, set_multicast);
+			container_of(param, struct lan78xx_priv, set_multicast);
 	struct lan78xx_net *dev = pdata->dev;
 	int i;
 
@@ -1251,8 +1272,10 @@ static void lan78xx_deferred_multicast_write(struct work_struct *param)
 
 	for (i = 1; i < NUM_OF_MAF; i++) {
 		lan78xx_write_reg(dev, MAF_HI(i), 0);
-		lan78xx_write_reg(dev, MAF_LO(i), pdata->pfilter_table[i][1]);
-		lan78xx_write_reg(dev, MAF_HI(i), pdata->pfilter_table[i][0]);
+		lan78xx_write_reg(dev, MAF_LO(i),
+				  pdata->pfilter_table[i][1]);
+		lan78xx_write_reg(dev, MAF_HI(i),
+				  pdata->pfilter_table[i][0]);
 	}
 
 	lan78xx_write_reg(dev, RFE_CTL, pdata->rfe_ctl);
@@ -1309,7 +1332,7 @@ static void lan78xx_set_multicast(struct net_device *netdev)
 				u32 bitnum = lan78xx_hash(ha->addr);
 
 				pdata->mchash_table[bitnum / 32] |=
-					(1 << (bitnum % 32));
+							(1 << (bitnum % 32));
 				pdata->rfe_ctl |= RFE_CTL_MCAST_HASH_;
 			}
 			i++;
@@ -1367,9 +1390,9 @@ static int lan78xx_mac_reset(struct lan78xx_net *dev)
 	mutex_lock(&dev->phy_mutex);
 
 	/* Resetting the device while there is activity on the MDIO
-   * bus can result in the MAC interface locking up and not
-   * completing register access transactions.
-   */
+	 * bus can result in the MAC interface locking up and not
+	 * completing register access transactions.
+	 */
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
 		goto done;
@@ -1384,8 +1407,8 @@ static int lan78xx_mac_reset(struct lan78xx_net *dev)
 		goto done;
 
 	/* Wait for the reset to complete before allowing any further
-   * MAC register accesses otherwise the MAC may lock up.
-   */
+	 * MAC register accesses otherwise the MAC may lock up.
+	 */
 	do {
 		ret = lan78xx_read_reg(dev, MAC_CR, &val);
 		if (ret < 0)
@@ -1516,8 +1539,8 @@ static void lan78xx_status(struct lan78xx_net *dev, struct urb *urb)
 	u32 intdata;
 
 	if (urb->actual_length != 4) {
-		netdev_warn(dev->net, "unexpected urb length %d",
-			    urb->actual_length);
+		netdev_warn(dev->net,
+			    "unexpected urb length %d", urb->actual_length);
 		return;
 	}
 
@@ -1530,8 +1553,8 @@ static void lan78xx_status(struct lan78xx_net *dev, struct urb *urb)
 		if (dev->domain_data.phyirq > 0)
 			generic_handle_irq_safe(dev->domain_data.phyirq);
 	} else {
-		netdev_warn(dev->net, "unexpected interrupt: 0x%08x\n",
-			    intdata);
+		netdev_warn(dev->net,
+			    "unexpected interrupt: 0x%08x\n", intdata);
 	}
 }
 
@@ -1570,12 +1593,14 @@ static int lan78xx_ethtool_set_eeprom(struct net_device *netdev,
 		return ret;
 
 	/* Invalid EEPROM_INDICATOR at offset zero will result in a failure
-   * to load data from EEPROM
-   */
+	 * to load data from EEPROM
+	 */
 	if (ee->magic == LAN78XX_EEPROM_MAGIC)
 		ret = lan78xx_write_raw_eeprom(dev, ee->offset, ee->len, data);
-	else if ((ee->magic == LAN78XX_OTP_MAGIC) && (ee->offset == 0) &&
-		 (ee->len == 512) && (data[0] == OTP_INDICATOR_1))
+	else if ((ee->magic == LAN78XX_OTP_MAGIC) &&
+		 (ee->offset == 0) &&
+		 (ee->len == 512) &&
+		 (data[0] == OTP_INDICATOR_1))
 		ret = lan78xx_write_raw_otp(dev, ee->offset, ee->len, data);
 
 	usb_autopm_put_interface(dev->intf);
@@ -1880,9 +1905,7 @@ static int lan78xx_set_pause(struct net_device *net,
 		dev->fc_request_control |= FLOW_CTRL_TX;
 
 	if (ecmd.base.autoneg) {
-		__ETHTOOL_DECLARE_LINK_MODE_MASK(fc) = {
-			0,
-		};
+		__ETHTOOL_DECLARE_LINK_MODE_MASK(fc) = { 0, };
 		u32 mii_adv;
 
 		linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT,
@@ -1912,8 +1935,9 @@ static int lan78xx_get_regs_len(struct net_device *netdev)
 		return (sizeof(lan78xx_regs) + PHY_REG_SIZE);
 }
 
-static void lan78xx_get_regs(struct net_device *netdev,
-			     struct ethtool_regs *regs, void *buf)
+static void
+lan78xx_get_regs(struct net_device *netdev, struct ethtool_regs *regs,
+		 void *buf)
 {
 	u32 *data = buf;
 	int i, j;
@@ -1932,28 +1956,28 @@ static void lan78xx_get_regs(struct net_device *netdev,
 }
 
 static const struct ethtool_ops lan78xx_ethtool_ops = {
-	.get_link = lan78xx_get_link,
-	.nway_reset = phy_ethtool_nway_reset,
-	.get_drvinfo = lan78xx_get_drvinfo,
-	.get_msglevel = lan78xx_get_msglevel,
-	.set_msglevel = lan78xx_set_msglevel,
+	.get_link	= lan78xx_get_link,
+	.nway_reset	= phy_ethtool_nway_reset,
+	.get_drvinfo	= lan78xx_get_drvinfo,
+	.get_msglevel	= lan78xx_get_msglevel,
+	.set_msglevel	= lan78xx_set_msglevel,
 	.get_eeprom_len = lan78xx_ethtool_get_eeprom_len,
-	.get_eeprom = lan78xx_ethtool_get_eeprom,
-	.set_eeprom = lan78xx_ethtool_set_eeprom,
+	.get_eeprom	= lan78xx_ethtool_get_eeprom,
+	.set_eeprom	= lan78xx_ethtool_set_eeprom,
 	.get_ethtool_stats = lan78xx_get_stats,
 	.get_sset_count = lan78xx_get_sset_count,
-	.get_strings = lan78xx_get_strings,
-	.get_wol = lan78xx_get_wol,
-	.set_wol = lan78xx_set_wol,
-	.get_ts_info = ethtool_op_get_ts_info,
-	.get_eee = lan78xx_get_eee,
-	.set_eee = lan78xx_set_eee,
-	.get_pauseparam = lan78xx_get_pause,
-	.set_pauseparam = lan78xx_set_pause,
+	.get_strings	= lan78xx_get_strings,
+	.get_wol	= lan78xx_get_wol,
+	.set_wol	= lan78xx_set_wol,
+	.get_ts_info	= ethtool_op_get_ts_info,
+	.get_eee	= lan78xx_get_eee,
+	.set_eee	= lan78xx_set_eee,
+	.get_pauseparam	= lan78xx_get_pause,
+	.set_pauseparam	= lan78xx_set_pause,
 	.get_link_ksettings = lan78xx_get_link_ksettings,
 	.set_link_ksettings = lan78xx_set_link_ksettings,
-	.get_regs_len = lan78xx_get_regs_len,
-	.get_regs = lan78xx_get_regs,
+	.get_regs_len	= lan78xx_get_regs_len,
+	.get_regs	= lan78xx_get_regs,
 };
 
 static void lan78xx_init_mac_address(struct lan78xx_net *dev)
@@ -1978,8 +2002,8 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 				  "MAC address read from Device Tree");
 		} else if (((lan78xx_read_eeprom(dev, EEPROM_MAC_OFFSET,
 						 ETH_ALEN, addr) == 0) ||
-			    (lan78xx_read_otp(dev, EEPROM_MAC_OFFSET, ETH_ALEN,
-					      addr) == 0)) &&
+			    (lan78xx_read_otp(dev, EEPROM_MAC_OFFSET,
+					      ETH_ALEN, addr) == 0)) &&
 			   is_valid_ether_addr(addr)) {
 			/* eeprom values are valid so use them */
 			netif_dbg(dev, ifup, dev->net,
@@ -1991,8 +2015,8 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 				  "MAC address set to random addr");
 		}
 
-		addr_lo = addr[0] | (addr[1] << 8) | (addr[2] << 16) |
-			  (addr[3] << 24);
+		addr_lo = addr[0] | (addr[1] << 8) |
+			  (addr[2] << 16) | (addr[3] << 24);
 		addr_hi = addr[4] | (addr[5] << 8);
 
 		lan78xx_write_reg(dev, RX_ADDRL, addr_lo);
@@ -2141,7 +2165,6 @@ static int lan78xx_mod_mdiobus_write_c45_over_c22(struct mii_bus *bus,
 done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
-
 	return 0;
 }
 
@@ -2226,8 +2249,8 @@ static void irq_unmap(struct irq_domain *d, unsigned int irq)
 }
 
 static const struct irq_domain_ops chip_domain_ops = {
-	.map = irq_map,
-	.unmap = irq_unmap,
+	.map	= irq_map,
+	.unmap	= irq_unmap,
 };
 
 static void lan78xx_irq_mask(struct irq_data *irqd)
@@ -2255,12 +2278,12 @@ static void lan78xx_irq_bus_sync_unlock(struct irq_data *irqd)
 {
 	struct irq_domain_data *data = irq_data_get_irq_chip_data(irqd);
 	struct lan78xx_net *dev =
-		container_of(data, struct lan78xx_net, domain_data);
+			container_of(data, struct lan78xx_net, domain_data);
 	u32 buf;
 
 	/* call register access here because irq_bus_lock & irq_bus_sync_unlock
-         * are only two callbacks executed in non-atomic contex.
-         */
+	 * are only two callbacks executed in non-atomic contex.
+	 */
 	lan78xx_read_reg(dev, INT_EP_CTL, &buf);
 	if (buf != data->irqenable)
 		lan78xx_write_reg(dev, INT_EP_CTL, data->irqenable);
@@ -2269,11 +2292,11 @@ static void lan78xx_irq_bus_sync_unlock(struct irq_data *irqd)
 }
 
 static struct irq_chip lan78xx_irqchip = {
-	.name = "lan78xx-irqs",
-	.irq_mask = lan78xx_irq_mask,
-	.irq_unmask = lan78xx_irq_unmask,
-	.irq_bus_lock = lan78xx_irq_bus_lock,
-	.irq_bus_sync_unlock = lan78xx_irq_bus_sync_unlock,
+	.name			= "lan78xx-irqs",
+	.irq_mask		= lan78xx_irq_mask,
+	.irq_unmask		= lan78xx_irq_unmask,
+	.irq_bus_lock		= lan78xx_irq_bus_lock,
+	.irq_bus_sync_unlock	= lan78xx_irq_bus_sync_unlock,
 };
 
 static int lan78xx_setup_irq_domain(struct lan78xx_net *dev)
@@ -2339,7 +2362,8 @@ static int lan8835_fixup(struct phy_device *phydev)
 	phy_write_mmd(phydev, MDIO_MMD_PCS, 0x8010, buf);
 
 	/* RGMII MAC TXC Delay Enable */
-	lan78xx_write_reg(dev, MAC_RGMII_ID, MAC_RGMII_ID_TXC_DELAY_EN_);
+	lan78xx_write_reg(dev, MAC_RGMII_ID,
+			  MAC_RGMII_ID_TXC_DELAY_EN_);
 
 	/* RGMII TX DLL Tune Adjust */
 	lan78xx_write_reg(dev, RGMII_TX_BYP_DLL, 0x3D00);
@@ -2438,18 +2462,14 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 		ret = phy_register_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0,
 						 ksz9031rnx_fixup);
 		if (ret < 0) {
-			netdev_err(
-				dev->net,
-				"Failed to register fixup for PHY_KSZ9031RNX\n");
+			netdev_err(dev->net, "Failed to register fixup for PHY_KSZ9031RNX\n");
 			return NULL;
 		}
 		/* external PHY fixup for LAN8835 */
 		ret = phy_register_fixup_for_uid(PHY_LAN8835, 0xfffffff0,
 						 lan8835_fixup);
 		if (ret < 0) {
-			netdev_err(
-				dev->net,
-				"Failed to register fixup for PHY_LAN8835\n");
+			netdev_err(dev->net, "Failed to register fixup for PHY_LAN8835\n");
 			return NULL;
 		}
 		ret = phy_register_fixup_for_uid(0, 0xfffffff0, bcm89881_fixup);
@@ -2468,9 +2488,7 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 
 static int lan78xx_phy_init(struct lan78xx_net *dev)
 {
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(fc) = {
-		0,
-	};
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(fc) = { 0, };
 	int ret;
 	u32 mii_adv;
 	struct phy_device *phydev;
@@ -2510,7 +2528,8 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 	/* set to AUTOMDIX */
 	phydev->mdix = ETH_TP_MDI_AUTO;
 
-	ret = phy_connect_direct(dev->net, phydev, lan78xx_link_status_change,
+	ret = phy_connect_direct(dev->net, phydev,
+				 lan78xx_link_status_change,
 				 dev->interface);
 	if (ret) {
 		netdev_err(dev->net, "can't attach PHY to %s\n",
@@ -2534,7 +2553,8 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 
 	/* support both flow controls */
 	dev->fc_request_control = (FLOW_CTRL_RX | FLOW_CTRL_TX);
-	linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->advertising);
+	linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+			   phydev->advertising);
 	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
 			   phydev->advertising);
 	mii_adv = (u32)mii_advertise_flowctrl(dev->fc_request_control);
@@ -2551,12 +2571,14 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 		if (len >= 0) {
 			/* Ensure the appropriate LEDs are enabled */
 			lan78xx_read_reg(dev, HW_CFG, &reg);
-			reg &= ~(HW_CFG_LED0_EN_ | HW_CFG_LED1_EN_ |
-				 HW_CFG_LED2_EN_ | HW_CFG_LED3_EN_);
+			reg &= ~(HW_CFG_LED0_EN_ |
+				 HW_CFG_LED1_EN_ |
+				 HW_CFG_LED2_EN_ |
+				 HW_CFG_LED3_EN_);
 			reg |= (len > 0) * HW_CFG_LED0_EN_ |
-			       (len > 1) * HW_CFG_LED1_EN_ |
-			       (len > 2) * HW_CFG_LED2_EN_ |
-			       (len > 3) * HW_CFG_LED3_EN_;
+				(len > 1) * HW_CFG_LED1_EN_ |
+				(len > 2) * HW_CFG_LED2_EN_ |
+				(len > 3) * HW_CFG_LED3_EN_;
 			lan78xx_write_reg(dev, HW_CFG, reg);
 		}
 	}
@@ -2604,12 +2626,11 @@ static int unlink_urbs(struct lan78xx_net *dev, struct sk_buff_head *q)
 
 	spin_lock_irqsave(&q->lock, flags);
 	while (!skb_queue_empty(q)) {
-		struct skb_data *entry;
+		struct skb_data	*entry;
 		struct urb *urb;
 		int ret;
 
-		skb_queue_walk(q, skb)
-		{
+		skb_queue_walk(q, skb) {
 			entry = (struct skb_data *)skb->cb;
 			if (entry->state != unlink_start)
 				goto found;
@@ -2620,16 +2641,16 @@ found:
 		urb = entry->urb;
 
 		/* Get reference count of the URB to avoid it to be
-     * freed during usb_unlink_urb, which may trigger
-     * use-after-free problem inside usb_unlink_urb since
-     * usb_unlink_urb is always racing with .complete
-     * handler(include defer_bh).
-     */
+		 * freed during usb_unlink_urb, which may trigger
+		 * use-after-free problem inside usb_unlink_urb since
+		 * usb_unlink_urb is always racing with .complete
+		 * handler(include defer_bh).
+		 */
 		usb_get_urb(urb);
 		spin_unlock_irqrestore(&q->lock, flags);
 		/* during some PM-driven resume scenarios,
-     * these (async) unlinks complete immediately
-     */
+		 * these (async) unlinks complete immediately
+		 */
 		ret = usb_unlink_urb(urb);
 		if (ret != -EINPROGRESS && ret != 0)
 			netdev_dbg(dev->net, "unlink urb err, %d\n", ret);
@@ -2679,9 +2700,12 @@ static int lan78xx_set_mac_addr(struct net_device *netdev, void *p)
 
 	eth_hw_addr_set(netdev, addr->sa_data);
 
-	addr_lo = netdev->dev_addr[0] | netdev->dev_addr[1] << 8 |
-		  netdev->dev_addr[2] << 16 | netdev->dev_addr[3] << 24;
-	addr_hi = netdev->dev_addr[4] | netdev->dev_addr[5] << 8;
+	addr_lo = netdev->dev_addr[0] |
+		  netdev->dev_addr[1] << 8 |
+		  netdev->dev_addr[2] << 16 |
+		  netdev->dev_addr[3] << 24;
+	addr_hi = netdev->dev_addr[4] |
+		  netdev->dev_addr[5] << 8;
 
 	lan78xx_write_reg(dev, RX_ADDRL, addr_lo);
 	lan78xx_write_reg(dev, RX_ADDRH, addr_hi);
@@ -2731,15 +2755,15 @@ static int lan78xx_set_features(struct net_device *netdev,
 static void lan78xx_deferred_vlan_write(struct work_struct *param)
 {
 	struct lan78xx_priv *pdata =
-		container_of(param, struct lan78xx_priv, set_vlan);
+			container_of(param, struct lan78xx_priv, set_vlan);
 	struct lan78xx_net *dev = pdata->dev;
 
 	lan78xx_dataport_write(dev, DP_SEL_RSEL_VLAN_DA_, 0,
 			       DP_SEL_VHF_VLAN_LEN, pdata->vlan_table);
 }
 
-static int lan78xx_vlan_rx_add_vid(struct net_device *netdev, __be16 proto,
-				   u16 vid)
+static int lan78xx_vlan_rx_add_vid(struct net_device *netdev,
+				   __be16 proto, u16 vid)
 {
 	struct lan78xx_net *dev = netdev_priv(netdev);
 	struct lan78xx_priv *pdata = (struct lan78xx_priv *)(dev->data[0]);
@@ -2757,8 +2781,8 @@ static int lan78xx_vlan_rx_add_vid(struct net_device *netdev, __be16 proto,
 	return 0;
 }
 
-static int lan78xx_vlan_rx_kill_vid(struct net_device *netdev, __be16 proto,
-				    u16 vid)
+static int lan78xx_vlan_rx_kill_vid(struct net_device *netdev,
+				    __be16 proto, u16 vid)
 {
 	struct lan78xx_net *dev = netdev_priv(netdev);
 	struct lan78xx_priv *pdata = (struct lan78xx_priv *)(dev->data[0]);
@@ -2788,14 +2812,18 @@ static void lan78xx_init_ltm(struct lan78xx_net *dev)
 		/* Get values from EEPROM first */
 		if (lan78xx_read_eeprom(dev, 0x3F, 2, temp) == 0) {
 			if (temp[0] == 24) {
-				ret = lan78xx_read_raw_eeprom(dev, temp[1] * 2,
-							      24, (u8 *)regs);
+				ret = lan78xx_read_raw_eeprom(dev,
+							      temp[1] * 2,
+							      24,
+							      (u8 *)regs);
 				if (ret < 0)
 					return;
 			}
 		} else if (lan78xx_read_otp(dev, 0x3F, 2, temp) == 0) {
 			if (temp[0] == 24) {
-				ret = lan78xx_read_raw_otp(dev, temp[1] * 2, 24,
+				ret = lan78xx_read_raw_otp(dev,
+							   temp[1] * 2,
+							   24,
 							   (u8 *)regs);
 				if (ret < 0)
 					return;
@@ -2877,7 +2905,7 @@ static int lan78xx_stop_hw(struct lan78xx_net *dev, u32 reg, u32 hw_enabled,
 
 		stopped = false;
 		timeout = jiffies + HW_DISABLE_TIMEOUT;
-		do {
+		do  {
 			ret = lan78xx_read_reg(dev, reg, &buf);
 			if (ret < 0)
 				return ret;
@@ -3165,8 +3193,7 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 		ret = lan78xx_read_raw_eeprom(dev, 0, 1, &sig);
 		if (!ret && sig != EEPROM_INDICATOR) {
 			/* Implies there is no external eeprom. Set mac speed */
-			netdev_info(dev->net,
-				    "No External EEPROM. Setting MAC Speed\n");
+			netdev_info(dev->net, "No External EEPROM. Setting MAC Speed\n");
 			buf |= MAC_CR_AUTO_DUPLEX_ | MAC_CR_AUTO_SPEED_;
 		}
 	}
@@ -3186,8 +3213,8 @@ static void lan78xx_init_stats(struct lan78xx_net *dev)
 	int i;
 
 	/* initialize for stats update
-   * some counters are 20bits and some are 32bits
-   */
+	 * some counters are 20bits and some are 32bits
+	 */
 	p = (u32 *)&dev->stats.rollover_max;
 	for (i = 0; i < (sizeof(dev->stats.rollover_max) / (sizeof(u32))); i++)
 		p[i] = 0xFFFFF;
@@ -3227,7 +3254,8 @@ static int lan78xx_open(struct net_device *net)
 	if (dev->urb_intr) {
 		ret = usb_submit_urb(dev->urb_intr, GFP_KERNEL);
 		if (ret < 0) {
-			netif_err(dev, ifup, dev->net, "intr submit %d\n", ret);
+			netif_err(dev, ifup, dev->net,
+				  "intr submit %d\n", ret);
 			goto done;
 		}
 	}
@@ -3279,7 +3307,8 @@ static void lan78xx_terminate_urbs(struct lan78xx_net *dev)
 	temp = unlink_urbs(dev, &dev->txq) + unlink_urbs(dev, &dev->rxq);
 
 	/* maybe wait for deletions to finish. */
-	while (!skb_queue_empty(&dev->rxq) || !skb_queue_empty(&dev->txq)) {
+	while (!skb_queue_empty(&dev->rxq) ||
+	       !skb_queue_empty(&dev->txq)) {
 		schedule_timeout(msecs_to_jiffies(UNLINK_TIMEOUT_MS));
 		set_current_state(TASK_UNINTERRUPTIBLE);
 		netif_dbg(dev, ifdown, dev->net,
@@ -3290,7 +3319,7 @@ static void lan78xx_terminate_urbs(struct lan78xx_net *dev)
 	remove_wait_queue(&unlink_wakeup, &wait);
 
 	/* empty Rx done, Rx overflow and Tx pend queues
-   */
+	 */
 	while (!skb_queue_empty(&dev->rxq_done)) {
 		struct sk_buff *skb = skb_dequeue(&dev->rxq_done);
 
@@ -3333,9 +3362,9 @@ static int lan78xx_stop(struct net_device *net)
 	usb_kill_urb(dev->urb_intr);
 
 	/* deferred work (task, timer, softirq) must also stop.
-   * can't flush_scheduled_work() until we drop rtnl (later),
-   * else workers could deadlock; so make workers a NOP.
-   */
+	 * can't flush_scheduled_work() until we drop rtnl (later),
+	 * else workers could deadlock; so make workers a NOP.
+	 */
 	clear_bit(EVENT_TX_HALT, &dev->flags);
 	clear_bit(EVENT_RX_HALT, &dev->flags);
 	clear_bit(EVENT_LINK_RESET, &dev->flags);
@@ -3408,7 +3437,8 @@ static void tx_complete(struct urb *urb)
 				  entry->urb->status);
 			break;
 		default:
-			netif_dbg(dev, tx_err, dev->net, "unknown tx err %d\n",
+			netif_dbg(dev, tx_err, dev->net,
+				  "unknown tx err %d\n",
 				  entry->urb->status);
 			break;
 		}
@@ -3421,13 +3451,14 @@ static void tx_complete(struct urb *urb)
 	lan78xx_release_tx_buf(dev, skb);
 
 	/* Re-schedule NAPI if Tx data pending but no URBs in progress.
-   */
-	if (skb_queue_empty(&dev->txq) && !skb_queue_empty(&dev->txq_pend))
+	 */
+	if (skb_queue_empty(&dev->txq) &&
+	    !skb_queue_empty(&dev->txq_pend))
 		napi_schedule(&dev->napi);
 }
 
-static void lan78xx_queue_skb(struct sk_buff_head *list, struct sk_buff *newsk,
-			      enum skb_state state)
+static void lan78xx_queue_skb(struct sk_buff_head *list,
+			      struct sk_buff *newsk, enum skb_state state)
 {
 	struct skb_data *entry = (struct skb_data *)newsk->cb;
 
@@ -3493,8 +3524,8 @@ static void lan78xx_tx_pend_skb_get(struct lan78xx_net *dev,
 	spin_unlock_irqrestore(&dev->txq_pend.lock, flags);
 }
 
-static netdev_tx_t lan78xx_start_xmit(struct sk_buff *skb,
-				      struct net_device *net)
+static netdev_tx_t
+lan78xx_start_xmit(struct sk_buff *skb, struct net_device *net)
 {
 	struct lan78xx_net *dev = netdev_priv(net);
 	unsigned int tx_pend_data_len;
@@ -3512,8 +3543,8 @@ static netdev_tx_t lan78xx_start_xmit(struct sk_buff *skb,
 		napi_schedule(&dev->napi);
 
 	/* Stop stack Tx queue if we have enough data to fill
-   * all the free Tx URBs.
-   */
+	 * all the free Tx URBs.
+	 */
 	if (tx_pend_data_len > lan78xx_tx_urb_space(dev)) {
 		netif_stop_queue(net);
 
@@ -3576,8 +3607,8 @@ static int lan78xx_bind(struct lan78xx_net *dev, struct usb_interface *intf)
 
 	ret = lan78xx_setup_irq_domain(dev);
 	if (ret < 0) {
-		netdev_warn(dev->net, "lan78xx_setup_irq_domain() failed : %d",
-			    ret);
+		netdev_warn(dev->net,
+			    "lan78xx_setup_irq_domain() failed : %d", ret);
 		goto out1;
 	}
 
@@ -3630,12 +3661,12 @@ static void lan78xx_unbind(struct lan78xx_net *dev, struct usb_interface *intf)
 }
 
 static void lan78xx_rx_csum_offload(struct lan78xx_net *dev,
-				    struct sk_buff *skb, u32 rx_cmd_a,
-				    u32 rx_cmd_b)
+				    struct sk_buff *skb,
+				    u32 rx_cmd_a, u32 rx_cmd_b)
 {
 	/* HW Checksum offload appears to be flawed if used when not stripping
-   * VLAN headers. Drop back to S/W checksums under these conditions.
-   */
+	 * VLAN headers. Drop back to S/W checksums under these conditions.
+	 */
 	if (!(dev->net->features & NETIF_F_RXCSUM) ||
 	    unlikely(rx_cmd_a & RX_CMD_A_ICSM_) ||
 	    ((rx_cmd_a & RX_CMD_A_FVTG_) &&
@@ -3648,8 +3679,8 @@ static void lan78xx_rx_csum_offload(struct lan78xx_net *dev,
 }
 
 static void lan78xx_rx_vlan_offload(struct lan78xx_net *dev,
-				    struct sk_buff *skb, u32 rx_cmd_a,
-				    u32 rx_cmd_b)
+				    struct sk_buff *skb,
+				    u32 rx_cmd_a, u32 rx_cmd_b)
 {
 	if ((dev->net->features & NETIF_F_HW_VLAN_CTAG_RX) &&
 	    (rx_cmd_a & RX_CMD_A_FVTG_))
@@ -3674,15 +3705,15 @@ static void lan78xx_skb_return(struct lan78xx_net *dev, struct sk_buff *skb)
 	napi_gro_receive(&dev->napi, skb);
 }
 
-static int lan78xx_rx(struct lan78xx_net *dev, struct sk_buff *skb, int budget,
-		      int *work_done)
+static int lan78xx_rx(struct lan78xx_net *dev, struct sk_buff *skb,
+		      int budget, int *work_done)
 {
 	if (skb->len < RX_SKB_MIN_LEN)
 		return 0;
 
 	/* Extract frames from the URB buffer and pass each one to
-   * the stack in a new NAPI SKB.
-   */
+	 * the stack in a new NAPI SKB.
+	 */
 	while (skb->len > 0) {
 		u32 rx_cmd_a, rx_cmd_b, align_count, size;
 		u16 rx_cmd_c;
@@ -3705,7 +3736,8 @@ static int lan78xx_rx(struct lan78xx_net *dev, struct sk_buff *skb, int budget,
 
 		if (unlikely(size > skb->len)) {
 			netif_dbg(dev, rx_err, dev->net,
-				  "size err rx_cmd_a=0x%08x\n", rx_cmd_a);
+				  "size err rx_cmd_a=0x%08x\n",
+				  rx_cmd_a);
 			return 0;
 		}
 
@@ -3737,10 +3769,10 @@ static int lan78xx_rx(struct lan78xx_net *dev, struct sk_buff *skb, int budget,
 			lan78xx_rx_vlan_offload(dev, skb2, rx_cmd_a, rx_cmd_b);
 
 			/* Processing of the URB buffer must complete once
-       * it has started. If the NAPI work budget is exhausted
-       * while frames remain they are added to the overflow
-       * queue for delivery in the next NAPI polling cycle.
-       */
+			 * it has started. If the NAPI work budget is exhausted
+			 * while frames remain they are added to the overflow
+			 * queue for delivery in the next NAPI polling cycle.
+			 */
 			if (*work_done < budget) {
 				lan78xx_skb_return(dev, skb2);
 				++(*work_done);
@@ -3770,13 +3802,14 @@ static inline void rx_process(struct lan78xx_net *dev, struct sk_buff *skb,
 
 static void rx_complete(struct urb *urb)
 {
-	struct sk_buff *skb = (struct sk_buff *)urb->context;
-	struct skb_data *entry = (struct skb_data *)skb->cb;
+	struct sk_buff	*skb = (struct sk_buff *)urb->context;
+	struct skb_data	*entry = (struct skb_data *)skb->cb;
 	struct lan78xx_net *dev = entry->dev;
 	int urb_status = urb->status;
 	enum skb_state state;
 
-	netif_dbg(dev, rx_status, dev->net, "rx done: status %d", urb->status);
+	netif_dbg(dev, rx_status, dev->net,
+		  "rx done: status %d", urb->status);
 
 	skb_put(skb, urb->actual_length);
 	state = rx_done;
@@ -3790,8 +3823,8 @@ static void rx_complete(struct urb *urb)
 			state = rx_cleanup;
 			dev->net->stats.rx_errors++;
 			dev->net->stats.rx_length_errors++;
-			netif_dbg(dev, rx_err, dev->net, "rx length %d\n",
-				  skb->len);
+			netif_dbg(dev, rx_err, dev->net,
+				  "rx length %d\n", skb->len);
 		}
 		usb_mark_last_busy(dev->udev);
 		break;
@@ -3799,10 +3832,10 @@ static void rx_complete(struct urb *urb)
 		dev->net->stats.rx_errors++;
 		lan78xx_defer_kevent(dev, EVENT_RX_HALT);
 		fallthrough;
-	case -ECONNRESET: /* async unlink */
-	case -ESHUTDOWN: /* hardware gone */
-		netif_dbg(dev, ifdown, dev->net, "rx shutdown, code %d\n",
-			  urb_status);
+	case -ECONNRESET:				/* async unlink */
+	case -ESHUTDOWN:				/* hardware gone */
+		netif_dbg(dev, ifdown, dev->net,
+			  "rx shutdown, code %d\n", urb_status);
 		state = rx_cleanup;
 		break;
 	case -EPROTO:
@@ -3829,18 +3862,19 @@ static void rx_complete(struct urb *urb)
 
 static int rx_submit(struct lan78xx_net *dev, struct sk_buff *skb, gfp_t flags)
 {
-	struct skb_data *entry = (struct skb_data *)skb->cb;
+	struct skb_data	*entry = (struct skb_data *)skb->cb;
 	size_t size = dev->rx_urb_size;
 	struct urb *urb = entry->urb;
 	unsigned long lockflags;
 	int ret = 0;
 
-	usb_fill_bulk_urb(urb, dev->udev, dev->pipe_in, skb->data, size,
-			  rx_complete, skb);
+	usb_fill_bulk_urb(urb, dev->udev, dev->pipe_in,
+			  skb->data, size, rx_complete, skb);
 
 	spin_lock_irqsave(&dev->rxq.lock, lockflags);
 
-	if (netif_device_present(dev->net) && netif_running(dev->net) &&
+	if (netif_device_present(dev->net) &&
+	    netif_running(dev->net) &&
 	    !test_bit(EVENT_RX_HALT, &dev->flags) &&
 	    !test_bit(EVENT_DEV_ASLEEP, &dev->flags)) {
 		ret = usb_submit_urb(urb, flags);
@@ -3861,8 +3895,8 @@ static int rx_submit(struct lan78xx_net *dev, struct sk_buff *skb, gfp_t flags)
 			napi_schedule(&dev->napi);
 			break;
 		default:
-			netif_dbg(dev, rx_err, dev->net, "rx submit, %d\n",
-				  ret);
+			netif_dbg(dev, rx_err, dev->net,
+				  "rx submit, %d\n", ret);
 			napi_schedule(&dev->napi);
 			break;
 		}
@@ -3883,7 +3917,7 @@ static void lan78xx_rx_urb_submit_all(struct lan78xx_net *dev)
 	struct sk_buff *rx_buf;
 
 	/* Ensure the maximum number of Rx URBs is submitted
-   */
+	 */
 	while ((rx_buf = lan78xx_get_rx_buf(dev)) != NULL) {
 		if (rx_submit(dev, rx_buf, GFP_ATOMIC) != 0)
 			break;
@@ -3943,10 +3977,10 @@ static struct skb_data *lan78xx_tx_buf_fill(struct lan78xx_net *dev,
 	entry->length = 0;
 
 	/* Work through the pending SKBs and copy the data of each SKB into
-   * the URB buffer if there room for all the SKB data.
-   *
-   * There must be at least DST+SRC+TYPE in the SKB (with padding enabled)
-   */
+	 * the URB buffer if there room for all the SKB data.
+	 *
+	 * There must be at least DST+SRC+TYPE in the SKB (with padding enabled)
+	 */
 	while (remain >= TX_SKB_MIN_LEN) {
 		unsigned int pending_bytes;
 		unsigned int align_bytes;
@@ -4002,7 +4036,7 @@ static void lan78xx_tx_bh(struct lan78xx_net *dev)
 	int ret;
 
 	/* Start the stack Tx queue if it was stopped
-         */
+	 */
 	netif_tx_lock(dev->net);
 	if (netif_queue_stopped(dev->net)) {
 		if (lan78xx_tx_pend_data_len(dev) < lan78xx_tx_urb_space(dev))
@@ -4011,9 +4045,9 @@ static void lan78xx_tx_bh(struct lan78xx_net *dev)
 	netif_tx_unlock(dev->net);
 
 	/* Go through the Tx pending queue and set up URBs to transfer
-   * the data to the device. Stop if no more pending data or URBs,
-   * or if an error occurs when a URB is submitted.
-   */
+	 * the data to the device. Stop if no more pending data or URBs,
+	 * or if an error occurs when a URB is submitted.
+	 */
 	do {
 		struct skb_data *entry;
 		struct sk_buff *tx_buf;
@@ -4099,17 +4133,17 @@ static int lan78xx_bh(struct lan78xx_net *dev, int budget)
 	int work_done = 0;
 
 	/* Pass frames received in the last NAPI cycle before
-         * working on newly completed URBs.
-         */
+	 * working on newly completed URBs.
+	 */
 	while (!skb_queue_empty(&dev->rxq_overflow)) {
 		lan78xx_skb_return(dev, skb_dequeue(&dev->rxq_overflow));
 		++work_done;
 	}
 
 	/* Take a snapshot of the done queue and move items to a
-   * temporary queue. Rx URB completions will continue to add
-   * to the done queue.
-   */
+	 * temporary queue. Rx URB completions will continue to add
+	 * to the done queue.
+	 */
 	__skb_queue_head_init(&done);
 
 	spin_lock_irqsave(&dev->rxq_done.lock, flags);
@@ -4117,9 +4151,10 @@ static int lan78xx_bh(struct lan78xx_net *dev, int budget)
 	spin_unlock_irqrestore(&dev->rxq_done.lock, flags);
 
 	/* Extract receive frames from completed URBs and
-   * pass them to the stack. Re-submit each completed URB.
-   */
-	while ((work_done < budget) && (rx_buf = __skb_dequeue(&done))) {
+	 * pass them to the stack. Re-submit each completed URB.
+	 */
+	while ((work_done < budget) &&
+	       (rx_buf = __skb_dequeue(&done))) {
 		entry = (struct skb_data *)(rx_buf->cb);
 		switch (entry->state) {
 		case rx_done:
@@ -4128,7 +4163,8 @@ static int lan78xx_bh(struct lan78xx_net *dev, int budget)
 		case rx_cleanup:
 			break;
 		default:
-			netdev_dbg(dev->net, "rx buf state %d\n", entry->state);
+			netdev_dbg(dev->net, "rx buf state %d\n",
+				   entry->state);
 			break;
 		}
 
@@ -4136,9 +4172,9 @@ static int lan78xx_bh(struct lan78xx_net *dev, int budget)
 	}
 
 	/* If budget was consumed before processing all the URBs put them
-   * back on the front of the done queue. They will be first to be
-   * processed in the next NAPI cycle.
-   */
+	 * back on the front of the done queue. They will be first to be
+	 * processed in the next NAPI cycle.
+	 */
 	spin_lock_irqsave(&dev->rxq_done.lock, flags);
 	skb_queue_splice(&done, &dev->rxq_done);
 	spin_unlock_irqrestore(&dev->rxq_done.lock, flags);
@@ -4185,8 +4221,8 @@ static int lan78xx_poll(struct napi_struct *napi, int budget)
 		napi_complete_done(napi, work_done);
 
 		/* Start a new polling cycle if data was received or
-     * data is waiting to be transmitted.
-     */
+		 * data is waiting to be transmitted.
+		 */
 		if (!skb_queue_empty(&dev->rxq_done)) {
 			napi_schedule(napi);
 		} else if (netif_carrier_ok(dev->net)) {
@@ -4225,7 +4261,9 @@ static void lan78xx_delayedwork(struct work_struct *work)
 		unlink_urbs(dev, &dev->txq);
 
 		status = usb_clear_halt(dev->udev, dev->pipe_out);
-		if (status < 0 && status != -EPIPE && status != -ESHUTDOWN) {
+		if (status < 0 &&
+		    status != -EPIPE &&
+		    status != -ESHUTDOWN) {
 			if (netif_msg_tx_err(dev))
 				netdev_err(dev->net,
 					   "can't clear tx halt, status %d\n",
@@ -4240,7 +4278,9 @@ static void lan78xx_delayedwork(struct work_struct *work)
 	if (test_bit(EVENT_RX_HALT, &dev->flags)) {
 		unlink_urbs(dev, &dev->rxq);
 		status = usb_clear_halt(dev->udev, dev->pipe_in);
-		if (status < 0 && status != -EPIPE && status != -ESHUTDOWN) {
+		if (status < 0 &&
+		    status != -EPIPE &&
+		    status != -ESHUTDOWN) {
 			if (netif_msg_rx_err(dev))
 				netdev_err(dev->net,
 					   "can't clear rx halt, status %d\n",
@@ -4256,7 +4296,8 @@ static void lan78xx_delayedwork(struct work_struct *work)
 
 		clear_bit(EVENT_LINK_RESET, &dev->flags);
 		if (lan78xx_link_reset(dev) < 0) {
-			netdev_info(dev->net, "link reset failed (%d)\n", ret);
+			netdev_info(dev->net, "link reset failed (%d)\n",
+				    ret);
 		}
 	}
 
@@ -4286,22 +4327,23 @@ static void intr_complete(struct urb *urb)
 		break;
 
 	/* software-driven interface shutdown */
-	case -ENOENT: /* urb killed */
-	case -ENODEV: /* hardware gone */
-	case -ESHUTDOWN: /* hardware gone */
-		netif_dbg(dev, ifdown, dev->net, "intr shutdown, code %d\n",
-			  status);
+	case -ENOENT:			/* urb killed */
+	case -ENODEV:			/* hardware gone */
+	case -ESHUTDOWN:		/* hardware gone */
+		netif_dbg(dev, ifdown, dev->net,
+			  "intr shutdown, code %d\n", status);
 		return;
 
 	/* NOTE:  not throttling like RX/TX, since this endpoint
-   * already polls infrequently
-   */
+	 * already polls infrequently
+	 */
 	default:
 		netdev_dbg(dev->net, "intr status %d\n", status);
 		break;
 	}
 
-	if (!netif_device_present(dev->net) || !netif_running(dev->net)) {
+	if (!netif_device_present(dev->net) ||
+	    !netif_running(dev->net)) {
 		netdev_warn(dev->net, "not submitting new status URB");
 		return;
 	}
@@ -4310,7 +4352,7 @@ static void intr_complete(struct urb *urb)
 	status = usb_submit_urb(urb, GFP_ATOMIC);
 
 	switch (status) {
-	case 0:
+	case  0:
 		break;
 	case -ENODEV:
 	case -ENOENT:
@@ -4319,8 +4361,8 @@ static void intr_complete(struct urb *urb)
 		netif_device_detach(dev->net);
 		break;
 	default:
-		netif_err(dev, timer, dev->net, "intr resubmit --> %d\n",
-			  status);
+		netif_err(dev, timer, dev->net,
+			  "intr resubmit --> %d\n", status);
 		break;
 	}
 }
@@ -4397,19 +4439,19 @@ static netdev_features_t lan78xx_features_check(struct sk_buff *skb,
 }
 
 static const struct net_device_ops lan78xx_netdev_ops = {
-	.ndo_open = lan78xx_open,
-	.ndo_stop = lan78xx_stop,
-	.ndo_start_xmit = lan78xx_start_xmit,
-	.ndo_tx_timeout = lan78xx_tx_timeout,
-	.ndo_change_mtu = lan78xx_change_mtu,
-	.ndo_set_mac_address = lan78xx_set_mac_addr,
-	.ndo_validate_addr = eth_validate_addr,
-	.ndo_eth_ioctl = phy_do_ioctl_running,
-	.ndo_set_rx_mode = lan78xx_set_multicast,
-	.ndo_set_features = lan78xx_set_features,
-	.ndo_vlan_rx_add_vid = lan78xx_vlan_rx_add_vid,
-	.ndo_vlan_rx_kill_vid = lan78xx_vlan_rx_kill_vid,
-	.ndo_features_check = lan78xx_features_check,
+	.ndo_open		= lan78xx_open,
+	.ndo_stop		= lan78xx_stop,
+	.ndo_start_xmit		= lan78xx_start_xmit,
+	.ndo_tx_timeout		= lan78xx_tx_timeout,
+	.ndo_change_mtu		= lan78xx_change_mtu,
+	.ndo_set_mac_address	= lan78xx_set_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_eth_ioctl		= phy_do_ioctl_running,
+	.ndo_set_rx_mode	= lan78xx_set_multicast,
+	.ndo_set_features	= lan78xx_set_features,
+	.ndo_vlan_rx_add_vid	= lan78xx_vlan_rx_add_vid,
+	.ndo_vlan_rx_kill_vid	= lan78xx_vlan_rx_kill_vid,
+	.ndo_features_check	= lan78xx_features_check,
 };
 
 static void lan78xx_stat_monitor(struct timer_list *t)
@@ -4601,8 +4643,8 @@ static int lan78xx_probe(struct usb_interface *intf,
 	dev->udev = udev;
 	dev->intf = intf;
 	dev->net = netdev;
-	dev->msg_enable = netif_msg_init(
-		msg_level, NETIF_MSG_DRV | NETIF_MSG_PROBE | NETIF_MSG_LINK);
+	dev->msg_enable = netif_msg_init(msg_level, NETIF_MSG_DRV
+					| NETIF_MSG_PROBE | NETIF_MSG_LINK);
 
 	skb_queue_head_init(&dev->rxq);
 	skb_queue_head_init(&dev->txq);
@@ -4668,8 +4710,8 @@ static int lan78xx_probe(struct usb_interface *intf,
 		goto out4;
 	}
 
-	dev->pipe_intr =
-		usb_rcvintpipe(dev->udev, usb_endpoint_num(&ep_intr->desc));
+	dev->pipe_intr = usb_rcvintpipe(dev->udev,
+					usb_endpoint_num(&ep_intr->desc));
 
 	ret = lan78xx_bind(dev, intf);
 	if (ret < 0)
@@ -4688,8 +4730,9 @@ static int lan78xx_probe(struct usb_interface *intf,
 		ret = -ENOMEM;
 		goto out6;
 	} else {
-		usb_fill_int_urb(dev->urb_intr, dev->udev, dev->pipe_intr, buf,
-				 maxp, intr_complete, dev, period);
+		usb_fill_int_urb(dev->urb_intr, dev->udev,
+				 dev->pipe_intr, buf, maxp,
+				 intr_complete, dev, period);
 		dev->urb_intr->transfer_flags |= URB_FREE_BUFFER;
 	}
 
@@ -4718,10 +4761,11 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	ret = device_set_wakeup_enable(&udev->dev, true);
 
-	/* Default delay of 2sec has more overhead than advantage.
-   * Set to 10sec as default.
-   */
-	pm_runtime_set_autosuspend_delay(&udev->dev, DEFAULT_AUTOSUSPEND_DELAY);
+	 /* Default delay of 2sec has more overhead than advantage.
+	  * Set to 10sec as default.
+	  */
+	pm_runtime_set_autosuspend_delay(&udev->dev,
+					 DEFAULT_AUTOSUSPEND_DELAY);
 
 	return 0;
 
@@ -4913,9 +4957,10 @@ static int lan78xx_set_suspend(struct lan78xx_net *dev, u32 wol)
 		/* set WUF_CFG & WUF_MASK for IPv4 Multicast */
 		crc = lan78xx_wakeframe_crc16(ipv4_multicast, 3);
 		ret = lan78xx_write_reg(dev, WUF_CFG(mask_index),
-					WUF_CFGX_EN_ | WUF_CFGX_TYPE_MCAST_ |
-						(0 << WUF_CFGX_OFFSET_SHIFT_) |
-						(crc & WUF_CFGX_CRC16_MASK_));
+					WUF_CFGX_EN_ |
+					WUF_CFGX_TYPE_MCAST_ |
+					(0 << WUF_CFGX_OFFSET_SHIFT_) |
+					(crc & WUF_CFGX_CRC16_MASK_));
 		if (ret < 0)
 			return ret;
 
@@ -4937,9 +4982,10 @@ static int lan78xx_set_suspend(struct lan78xx_net *dev, u32 wol)
 		/* for IPv6 Multicast */
 		crc = lan78xx_wakeframe_crc16(ipv6_multicast, 2);
 		ret = lan78xx_write_reg(dev, WUF_CFG(mask_index),
-					WUF_CFGX_EN_ | WUF_CFGX_TYPE_MCAST_ |
-						(0 << WUF_CFGX_OFFSET_SHIFT_) |
-						(crc & WUF_CFGX_CRC16_MASK_));
+					WUF_CFGX_EN_ |
+					WUF_CFGX_TYPE_MCAST_ |
+					(0 << WUF_CFGX_OFFSET_SHIFT_) |
+					(crc & WUF_CFGX_CRC16_MASK_));
 		if (ret < 0)
 			return ret;
 
@@ -4973,13 +5019,14 @@ static int lan78xx_set_suspend(struct lan78xx_net *dev, u32 wol)
 		temp_wucsr |= WUCSR_WAKE_EN_;
 
 		/* set WUF_CFG & WUF_MASK
-     * for packettype (offset 12,13) = ARP (0x0806)
-     */
+		 * for packettype (offset 12,13) = ARP (0x0806)
+		 */
 		crc = lan78xx_wakeframe_crc16(arp_type, 2);
 		ret = lan78xx_write_reg(dev, WUF_CFG(mask_index),
-					WUF_CFGX_EN_ | WUF_CFGX_TYPE_ALL_ |
-						(0 << WUF_CFGX_OFFSET_SHIFT_) |
-						(crc & WUF_CFGX_CRC16_MASK_));
+					WUF_CFGX_EN_ |
+					WUF_CFGX_TYPE_ALL_ |
+					(0 << WUF_CFGX_OFFSET_SHIFT_) |
+					(crc & WUF_CFGX_CRC16_MASK_));
 		if (ret < 0)
 			return ret;
 
@@ -5041,8 +5088,8 @@ static int lan78xx_suspend(struct usb_interface *intf, pm_message_t message)
 
 	mutex_lock(&dev->dev_mutex);
 
-	netif_dbg(dev, ifdown, dev->net, "suspending: pm event %#x",
-		  message.event);
+	netif_dbg(dev, ifdown, dev->net,
+		  "suspending: pm event %#x", message.event);
 
 	dev_open = test_bit(EVENT_DEV_OPEN, &dev->flags);
 
@@ -5099,8 +5146,8 @@ static int lan78xx_suspend(struct usb_interface *intf, pm_message_t message)
 		}
 	} else {
 		/* Interface is down; don't allow WOL and PHY
-     * events to wake up the host
-     */
+		 * events to wake up the host
+		 */
 		u32 buf;
 
 		set_bit(EVENT_DEV_ASLEEP, &dev->flags);
@@ -5153,7 +5200,8 @@ static bool lan78xx_submit_deferred_urbs(struct lan78xx_net *dev)
 		int ret;
 
 		if (!netif_device_present(dev->net) ||
-		    !netif_carrier_ok(dev->net) || pipe_halted) {
+		    !netif_carrier_ok(dev->net) ||
+		    pipe_halted) {
 			lan78xx_release_tx_buf(dev, skb);
 			continue;
 		}
@@ -5203,8 +5251,7 @@ static int lan78xx_resume(struct usb_interface *intf)
 			if (ret < 0) {
 				if (ret == -ENODEV)
 					netif_device_detach(dev->net);
-				netdev_warn(dev->net,
-					    "Failed to submit intr URB");
+				netdev_warn(dev->net, "Failed to submit intr URB");
 			}
 		}
 
@@ -5221,7 +5268,8 @@ static int lan78xx_resume(struct usb_interface *intf)
 
 		spin_unlock_irq(&dev->txq.lock);
 
-		if (!pipe_halted && netif_device_present(dev->net) &&
+		if (!pipe_halted &&
+		    netif_device_present(dev->net) &&
 		    (lan78xx_tx_pend_data_len(dev) < lan78xx_tx_urb_space(dev)))
 			netif_start_queue(dev->net);
 
@@ -5251,18 +5299,20 @@ static int lan78xx_resume(struct usb_interface *intf)
 	if (ret < 0)
 		goto out;
 
-	ret = lan78xx_write_reg(dev, WUCSR2,
-				WUCSR2_NS_RCD_ | WUCSR2_ARP_RCD_ |
-					WUCSR2_IPV6_TCPSYN_RCD_ |
-					WUCSR2_IPV4_TCPSYN_RCD_);
+	ret = lan78xx_write_reg(dev, WUCSR2, WUCSR2_NS_RCD_ |
+					     WUCSR2_ARP_RCD_ |
+					     WUCSR2_IPV6_TCPSYN_RCD_ |
+					     WUCSR2_IPV4_TCPSYN_RCD_);
 	if (ret < 0)
 		goto out;
 
-	ret = lan78xx_write_reg(dev, WUCSR,
-				WUCSR_EEE_TX_WAKE_ | WUCSR_EEE_RX_WAKE_ |
-					WUCSR_PFDA_FR_ | WUCSR_RFE_WAKE_FR_ |
-					WUCSR_WUFR_ | WUCSR_MPR_ |
-					WUCSR_BCST_FR_);
+	ret = lan78xx_write_reg(dev, WUCSR, WUCSR_EEE_TX_WAKE_ |
+					    WUCSR_EEE_RX_WAKE_ |
+					    WUCSR_PFDA_FR_ |
+					    WUCSR_RFE_WAKE_FR_ |
+					    WUCSR_WUFR_ |
+					    WUCSR_MPR_ |
+					    WUCSR_BCST_FR_);
 	if (ret < 0)
 		goto out;
 
@@ -5293,34 +5343,34 @@ static int lan78xx_reset_resume(struct usb_interface *intf)
 
 static const struct usb_device_id products[] = {
 	{
-		/* LAN7800 USB Gigabit Ethernet Device */
-		USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7800_USB_PRODUCT_ID),
+	/* LAN7800 USB Gigabit Ethernet Device */
+	USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7800_USB_PRODUCT_ID),
 	},
 	{
-		/* LAN7850 USB Gigabit Ethernet Device */
-		USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7850_USB_PRODUCT_ID),
+	/* LAN7850 USB Gigabit Ethernet Device */
+	USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7850_USB_PRODUCT_ID),
 	},
 	{
-		/* LAN7801 USB Gigabit Ethernet Device */
-		USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7801_USB_PRODUCT_ID),
+	/* LAN7801 USB Gigabit Ethernet Device */
+	USB_DEVICE(LAN78XX_USB_VENDOR_ID, LAN7801_USB_PRODUCT_ID),
 	},
 	{
-		/* ATM2-AF USB Gigabit Ethernet Device */
-		USB_DEVICE(AT29M2AF_USB_VENDOR_ID, AT29M2AF_USB_PRODUCT_ID),
+	/* ATM2-AF USB Gigabit Ethernet Device */
+	USB_DEVICE(AT29M2AF_USB_VENDOR_ID, AT29M2AF_USB_PRODUCT_ID),
 	},
 	{},
 };
 MODULE_DEVICE_TABLE(usb, products);
 
 static struct usb_driver lan78xx_driver = {
-	.name = DRIVER_NAME,
-	.id_table = products,
-	.probe = lan78xx_probe,
-	.disconnect = lan78xx_disconnect,
-	.suspend = lan78xx_suspend,
-	.resume = lan78xx_resume,
-	.reset_resume = lan78xx_reset_resume,
-	.supports_autosuspend = 1,
+	.name			= DRIVER_NAME,
+	.id_table		= products,
+	.probe			= lan78xx_probe,
+	.disconnect		= lan78xx_disconnect,
+	.suspend		= lan78xx_suspend,
+	.resume			= lan78xx_resume,
+	.reset_resume		= lan78xx_reset_resume,
+	.supports_autosuspend	= 1,
 	.disable_hub_initiated_lpm = 1,
 };
 
