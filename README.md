@@ -4,9 +4,12 @@ This allows you to use HydraLink without the python utility, configuring it usin
 
 ## Compilation
 ```bash
-sudo apt install linux-headers-($uname -r)
-git clone https://github.com/dissecto-GmbH/usb2ae-kernel-module.git
-cd usb2ae-kernel-module
+# Install prerequisites (ubuntu-specific, might be different on other distros)
+sudo apt install linux-headers-$(uname -r)
+# Clone the project
+git clone https://github.com/dissecto-GmbH/hydralink-kernel-module.git
+cd hydralink-kernel-module
+# Compile the kernel modules
 make
 cd phy_driver
 make
@@ -16,9 +19,11 @@ cd ..
 ## Usage
 
 ```bash
+# Remove existing modules, in case they were already loaded
 sudo rmmod lan78xx
 sudo rmmod lan78xx_mod
 sudo rmmod bcm89881
+# Load the modules we just compile
 sudo insmod phy_driver/bcm89881.ko
 sudo insmod lan78xx_mod.ko
 ```
