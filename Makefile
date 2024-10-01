@@ -1,5 +1,5 @@
 
-obj-m += lan78xx_mod.o
+obj-m += hydralink.o
 
 CFLAGS = -Wall #-Werror
 ccflags-y += $(CFLAGS)
@@ -11,4 +11,4 @@ clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 
 load: all
-	sudo insmod lan78xx_mod.ko
+	sudo insmod hydralink.ko
