@@ -173,11 +173,6 @@
 #define INT_EP_GPIO_1			(1)
 #define INT_EP_GPIO_0			(0)
 
-/* Compatibility with kernels from before 2024 */
-#ifndef ethtool_keee
-#define ethtool_keee ethtool_eee
-#endif
-
 static const char lan78xx_gstrings[][ETH_GSTRING_LEN] = {
 	"RX FCS Errors",
 	"RX Alignment Errors",
@@ -1976,16 +1971,22 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 }
 
 /* MDIO read and write wrappers for phylib */
-static int __lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
+static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
+	ret = usb_autopm_get_interface(dev->intf);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&dev->phy_mutex);
+
 	/* confirm MII not busy */
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		return -1;
+		goto done;
 
 	/* set the address, index & direction (read from PHY) */
 	addr = mii_access(phy_id, idx, MII_READ);
@@ -1993,24 +1994,36 @@ static int __lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		return -1;
+		goto done;
 
 	ret = lan78xx_read_reg(dev, MII_DATA, &val);
 
-	return (int)(val & 0xFFFF);
+	ret = (int)(val & 0xFFFF);
+
+done:
+	mutex_unlock(&dev->phy_mutex);
+	usb_autopm_put_interface(dev->intf);
+
+	return ret;
 }
 
-static int __lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
-				   u16 regval)
+static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
+				 u16 regval)
 {
 	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
+	ret = usb_autopm_get_interface(dev->intf);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&dev->phy_mutex);
+
 	/* confirm MII not busy */
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		return -1;
+		goto done;
 
 	val = (u32)regval;
 	ret = lan78xx_write_reg(dev, MII_DATA, val);
@@ -2021,44 +2034,9 @@ static int __lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		return -1;
+		goto done;
 
-	return 0;
-}
-
-static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
-{
-	struct lan78xx_net *dev = bus->priv;
-	int ret;
-
-	ret = usb_autopm_get_interface(dev->intf);
-	if (ret < 0)
-		return ret;
-
-	mutex_lock(&dev->phy_mutex);
-
-	ret = __lan78xx_mdiobus_read(bus, phy_id, idx);
-
-	mutex_unlock(&dev->phy_mutex);
-	usb_autopm_put_interface(dev->intf);
-
-	return ret;
-}
-
-static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
-				 u16 regval)
-{
-	struct lan78xx_net *dev = bus->priv;
-	int ret;
-
-	ret = usb_autopm_get_interface(dev->intf);
-	if (ret < 0)
-		return ret;
-
-	mutex_lock(&dev->phy_mutex);
-
-	ret = __lan78xx_mdiobus_write(bus, phy_id, idx, regval);
-
+done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
 	return 0;
@@ -2067,24 +2045,19 @@ static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
 static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 						 int phy_id, int devad, int idx)
 {
-	struct lan78xx_net *dev = bus->priv;
 	int ret;
-
-	ret = usb_autopm_get_interface(dev->intf);
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
 	if (ret < 0)
-		return ret;
+		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
+	if (ret < 0)
+		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
+	if (ret < 0)
+		goto done;
+	ret = lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
 
-	mutex_lock(&dev->phy_mutex);
-
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | 1);
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | 1);
-
-	ret = __lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
-
-	mutex_unlock(&dev->phy_mutex);
-	usb_autopm_put_interface(dev->intf);
-
+done:
 	return ret;
 }
 
@@ -2092,22 +2065,19 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 						  int phy_id, int devad,
 						  int idx, u16 val)
 {
-	struct lan78xx_net *dev = bus->priv;
 	int ret;
-
-	ret = usb_autopm_get_interface(dev->intf);
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
 	if (ret < 0)
-		return ret;
+		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
+	if (ret < 0)
+		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
+	if (ret < 0)
+		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
 
-	mutex_lock(&dev->phy_mutex);
-
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | 1);
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | 1);
-	__lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
-
-	mutex_unlock(&dev->phy_mutex);
-	usb_autopm_put_interface(dev->intf);
+done:
 	return 0;
 }
 
@@ -2123,8 +2093,8 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	}
 
 	dev->mdiobus->priv = (void *)dev;
-	dev->mdiobus->read = lan78xx_mdiobus_read_c22;
-	dev->mdiobus->write = lan78xx_mdiobus_write_c22;
+	dev->mdiobus->read = lan78xx_mdiobus_read;
+	dev->mdiobus->write = lan78xx_mdiobus_write;
 	dev->mdiobus->read_c45 = lan78xx_mdiobus_read_c45;
 	dev->mdiobus->write_c45 = lan78xx_mdiobus_write_c45;
 	dev->mdiobus->name = "lan78xx-mdiobus";
@@ -2168,7 +2138,20 @@ static void lan78xx_remove_mdio(struct lan78xx_net *dev)
 
 static void lan78xx_link_status_change(struct net_device *net)
 {
+	struct lan78xx_net *dev = netdev_priv(net);
 	struct phy_device *phydev = net->phydev;
+	u32 data;
+	int ret;
+
+	ret = lan78xx_read_reg(dev, MAC_CR, &data);
+	if (ret < 0)
+		return;
+
+	if (phydev->enable_tx_lpi)
+		data |=  MAC_CR_EEE_EN_;
+	else
+		data &= ~MAC_CR_EEE_EN_;
+	lan78xx_write_reg(dev, MAC_CR, data);
 
 	phy_print_status(phydev);
 }
@@ -2333,38 +2316,6 @@ static int ksz9031rnx_fixup(struct phy_device *phydev)
 	return 1;
 }
 
-static int bcm89881_fixup(struct phy_device *phydev)
-{
-	struct lan78xx_net *dev = netdev_priv(phydev->attached_dev);
-	u32 buf;
-	int ret;
-
-	if (!phydev->attached_dev) {
-		pr_err("Error: no net device attached to phy!\n");
-		return -ENODEV;
-	}
-
-	if (!phydev->is_c45)
-		return 0;
-
-	if (!phy_id_compare(phydev->c45_ids.device_ids[1], PHY_BCM89881,
-			    0xfffffff0))
-		return 0;
-
-	pr_info("bcm fixup\n");
-
-	dev->interface = PHY_INTERFACE_MODE_RGMII;
-
-	ret = lan78xx_write_reg(dev, MAC_RGMII_ID, MAC_RGMII_ID_TXC_DELAY_EN_);
-	ret = lan78xx_write_reg(dev, RGMII_TX_BYP_DLL, 0x3D00);
-	ret = lan78xx_read_reg(dev, HW_CFG, &buf);
-	buf |= HW_CFG_CLK125_EN_;
-	buf |= HW_CFG_REFCLK25_EN_;
-	ret = lan78xx_write_reg(dev, HW_CFG, buf);
-
-	return ret;
-}
-
 static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 {
 	u32 buf;
@@ -2398,6 +2349,15 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 			netdev_err(dev->net, "no PHY driver found\n");
 			return NULL;
 		}
+		if (phydev->is_c45 && phy_id_compare(phydev->c45_ids.device_ids[1],
+											 PHY_BCM89881, 0xfffffff0)) {
+			netdev_info(dev->net, "Applying BCM89881 fixup\n");
+			ret = lan78xx_write_reg(dev, MAC_RGMII_ID, MAC_RGMII_ID_TXC_DELAY_EN_);
+			ret = lan78xx_read_reg(dev, HW_CFG, &buf);
+			buf |= HW_CFG_CLK125_EN_;
+			buf |= HW_CFG_REFCLK25_EN_;
+			ret = lan78xx_write_reg(dev, HW_CFG, buf);
+		}
 		dev->interface = PHY_INTERFACE_MODE_RGMII;
 		/* external PHY fixup for KSZ9031RNX */
 		ret = phy_register_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0,
@@ -2411,13 +2371,6 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 						 lan8835_fixup);
 		if (ret < 0) {
 			netdev_err(dev->net, "Failed to register fixup for PHY_LAN8835\n");
-			return NULL;
-		}
-		ret = phy_register_fixup_for_uid(0, 0xfffffff0, bcm89881_fixup);
-		if (ret < 0) {
-			netdev_err(
-				dev->net,
-				"Failed to register fixup for PHY_BCM89881\n");
 			return NULL;
 		}
 		/* add more external PHY fixup here if needed */
@@ -2483,7 +2436,6 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 							     0xfffffff0);
 				phy_unregister_fixup_for_uid(PHY_LAN8835,
 							     0xfffffff0);
-				phy_unregister_fixup_for_uid(0, 0xfffffff0);
 			}
 		}
 		return -EIO;
@@ -2501,6 +2453,8 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 	mii_adv = (u32)mii_advertise_flowctrl(dev->fc_request_control);
 	mii_adv_to_linkmode_adv_t(fc, mii_adv);
 	linkmode_or(phydev->advertising, fc, phydev->advertising);
+
+	phy_support_eee(phydev);
 
 	if (phydev->mdio.dev.of_node) {
 		u32 reg;
@@ -4340,7 +4294,6 @@ static void lan78xx_disconnect(struct usb_interface *intf)
 
 	phy_unregister_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0);
 	phy_unregister_fixup_for_uid(PHY_LAN8835, 0xfffffff0);
-	phy_unregister_fixup_for_uid(0, 0xfffffff0);
 
 	phy_disconnect(net->phydev);
 
