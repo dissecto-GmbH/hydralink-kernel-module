@@ -2,14 +2,30 @@
 
 This allows you to use HydraLink without the python utility, configuring it using ethtool instead.
 
-## Compilation
+## Download sources and prerequisites
 ```bash
-# Install prerequisites (ubuntu-specific, might be different on other distros)
-sudo apt install linux-headers-$(uname -r)
+# Install prerequisites (ubuntu, may be different on other distros)
+sudo apt install linux-headers-$(uname -r) build-essential
+
 # Clone the project
 git clone https://github.com/dissecto-GmbH/hydralink-kernel-module.git
 cd hydralink-kernel-module
-git checkout release
+
+# Checkout the appropriate branch for your kernel
+git checkout release-v6.8
+```
+
+The `release` branch is compatible with updated versions of the Linux kernel (6.11).
+
+If you are using an older kernel, checkout the appropriate branch:
+
+```bash
+git checkout release-v6.11
+git checkout release-v6.8
+```
+
+## Build
+```bash
 # Compile the kernel modules
 make
 cd phy_driver
