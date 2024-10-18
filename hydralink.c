@@ -1988,40 +1988,33 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 	eth_hw_addr_set(dev->net, addr);
 }
 
-/* MDIO read and write wrappers for phylib */
+/* internal MDIO read and write wrappers, mutex must be locked by the caller */
 static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
-	ret = usb_autopm_get_interface(dev->intf);
-	if (ret < 0)
-		return ret;
-
-	mutex_lock(&dev->phy_mutex);
-
 	/* confirm MII not busy */
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		goto done;
+		return ret;
 
 	/* set the address, index & direction (read from PHY) */
 	addr = mii_access(phy_id, idx, MII_READ);
 	ret = lan78xx_write_reg(dev, MII_ACC, addr);
+	if (ret < 0)
+		return ret;
 
 	ret = lan78xx_phy_wait_not_busy(dev);
 	if (ret < 0)
-		goto done;
+		return ret;
 
 	ret = lan78xx_read_reg(dev, MII_DATA, &val);
+	if (ret < 0)
+		return ret;
 
 	ret = (int)(val & 0xFFFF);
-
-done:
-	mutex_unlock(&dev->phy_mutex);
-	usb_autopm_put_interface(dev->intf);
-
 	return ret;
 }
 
@@ -2032,38 +2025,76 @@ static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 	u32 val, addr;
 	int ret;
 
+	/* confirm MII not busy */
+	ret = lan78xx_phy_wait_not_busy(dev);
+	if (ret < 0)
+		return ret;
+
+	val = (u32)regval;
+	ret = lan78xx_write_reg(dev, MII_DATA, val);
+	if (ret < 0)
+		return ret;
+
+	/* set the address, index & direction (write to PHY) */
+	addr = mii_access(phy_id, idx, MII_WRITE);
+	ret = lan78xx_write_reg(dev, MII_ACC, addr);
+	if (ret < 0)
+		return ret;
+
+	ret = lan78xx_phy_wait_not_busy(dev);
+	return ret;
+}
+
+/* MDIO read and write wrappers for phylib */
+static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
+{
+	struct lan78xx_net *dev = bus->priv;
+	int ret;
+
+	ret = usb_autopm_get_interface(dev->intf);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&dev->phy_mutex);
+	ret = lan78xx_mdiobus_read(bus, phy_id, idx);
+
+	mutex_unlock(&dev->phy_mutex);
+	usb_autopm_put_interface(dev->intf);
+
+	return ret;
+}
+
+static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
+				 u16 regval)
+{
+	struct lan78xx_net *dev = bus->priv;
+	int ret;
+
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
 		return ret;
 
 	mutex_lock(&dev->phy_mutex);
 
-	/* confirm MII not busy */
-	ret = lan78xx_phy_wait_not_busy(dev);
-	if (ret < 0)
-		goto done;
+	ret = lan78xx_mdiobus_write(bus, phy_id, idx, regval);
 
-	val = (u32)regval;
-	ret = lan78xx_write_reg(dev, MII_DATA, val);
-
-	/* set the address, index & direction (write to PHY) */
-	addr = mii_access(phy_id, idx, MII_WRITE);
-	ret = lan78xx_write_reg(dev, MII_ACC, addr);
-
-	ret = lan78xx_phy_wait_not_busy(dev);
-	if (ret < 0)
-		goto done;
-
-done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
-	return 0;
+	return ret;
 }
 
 static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 						 int phy_id, int devad, int idx)
 {
 	int ret;
+	struct lan78xx_net *dev = bus->priv;
+
+	ret = usb_autopm_get_interface(dev->intf);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&dev->phy_mutex);
+
 	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
 	if (ret < 0)
 		goto done;
@@ -2076,6 +2107,8 @@ static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 	ret = lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
 
 done:
+	mutex_unlock(&dev->phy_mutex);
+	usb_autopm_put_interface(dev->intf);
 	return ret;
 }
 
@@ -2084,6 +2117,14 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 						  int idx, u16 val)
 {
 	int ret;
+	struct lan78xx_net *dev = bus->priv;
+
+	ret = usb_autopm_get_interface(dev->intf);
+	if (ret < 0)
+		return ret;
+
+	mutex_lock(&dev->phy_mutex);
+
 	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
 	if (ret < 0)
 		goto done;
@@ -2096,6 +2137,8 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
 
 done:
+	mutex_unlock(&dev->phy_mutex);
+	usb_autopm_put_interface(dev->intf);
 	return 0;
 }
 
@@ -2111,8 +2154,8 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	}
 
 	dev->mdiobus->priv = (void *)dev;
-	dev->mdiobus->read = lan78xx_mdiobus_read;
-	dev->mdiobus->write = lan78xx_mdiobus_write;
+	dev->mdiobus->read = lan78xx_mdiobus_read_c22;
+	dev->mdiobus->write = lan78xx_mdiobus_write_c22;
 	dev->mdiobus->read_c45 = lan78xx_mdiobus_read_c45;
 	dev->mdiobus->write_c45 = lan78xx_mdiobus_write_c45;
 	dev->mdiobus->name = "lan78xx-mdiobus";
