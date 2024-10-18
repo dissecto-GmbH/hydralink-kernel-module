@@ -50,6 +50,8 @@ static int bcm89881_config_aneg(struct phy_device *phydev)
 {
 	if (phydev->autoneg == AUTONEG_DISABLE) {
 		switch (phydev->speed) {
+		case SPEED_UNKNOWN:
+			break;
 		case SPEED_100:
 			phy_modify_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_CTRL1, BMCR_SPEED100 | BMCR_SPEED1000, BMCR_SPEED100);
 			break;
@@ -57,6 +59,7 @@ static int bcm89881_config_aneg(struct phy_device *phydev)
 			phy_modify_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_CTRL1, BMCR_SPEED1000 | BMCR_SPEED100, BMCR_SPEED1000);
 			break;
 		default:
+			phydev_warn(phydev, "Attempting to set unsupported speed %d\n", phydev->speed);
 			return -EINVAL;
 		}
 	}
