@@ -2524,7 +2524,7 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 		}
 	}
 
-	genphy_config_aneg(phydev);
+	phy_config_aneg(phydev);
 
 	dev->fc_autoneg = phydev->autoneg;
 
