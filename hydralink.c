@@ -5165,6 +5165,7 @@ static struct usb_driver lan78xx_driver = {
 
 module_usb_driver(lan78xx_driver);
 
+MODULE_SOFTDEP("pre: bcm89881");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");

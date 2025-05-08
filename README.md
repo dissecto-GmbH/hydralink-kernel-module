@@ -11,16 +11,15 @@ sudo apt install linux-headers-$(uname -r) build-essential
 git clone https://github.com/dissecto-GmbH/hydralink-kernel-module.git
 cd hydralink-kernel-module
 
-# Checkout the appropriate branch for your kernel
-git checkout release-v6.8
+# Optionally, checkout the appropriate branch for your kernel
+#git checkout release-v6.8
 ```
 
-The `release` branch is compatible with updated versions of the Linux kernel (6.11).
+The `release` branch is compatible with updated versions of the Linux kernel (6.11 and above).
 
 If you are using an older kernel, checkout the appropriate branch:
 
 ```bash
-git checkout release-v6.11
 git checkout release-v6.8
 ```
 
