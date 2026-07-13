@@ -28,6 +28,7 @@
 #include <linux/phy_fixed.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
+#include <linux/timer.h>
 #include "lan78xx.h"
 
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
@@ -1264,6 +1265,17 @@ static void lan78xx_deferred_multicast_write(struct work_struct *param)
 	lan78xx_write_reg(dev, RFE_CTL, pdata->rfe_ctl);
 }
 
+static void lan78xx_update_vlan_filter(struct lan78xx_priv *pdata,
+				       struct net_device *netdev,
+				       netdev_features_t features)
+{
+	if ((features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+	    !(netdev->flags & IFF_PROMISC))
+		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
+	else
+		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
+}
+
 static void lan78xx_set_multicast(struct net_device *netdev)
 {
 	struct lan78xx_net *dev = netdev_priv(netdev);
@@ -1297,6 +1309,8 @@ static void lan78xx_set_multicast(struct net_device *netdev)
 			pdata->rfe_ctl |= RFE_CTL_MCAST_EN_;
 		}
 	}
+
+	lan78xx_update_vlan_filter(pdata, dev->net, dev->net->features);
 
 	if (netdev_mc_count(dev->net)) {
 		struct netdev_hw_addr *ha;
@@ -1435,7 +1449,7 @@ static int lan78xx_link_reset(struct lan78xx_net *dev)
 		if (ret < 0)
 			return ret;
 
-		del_timer(&dev->stat_monitor);
+		timer_delete(&dev->stat_monitor);
 	} else if (link && !dev->link_on) {
 		dev->link_on = true;
 
@@ -1970,10 +1984,15 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 	eth_hw_addr_set(dev->net, addr);
 }
 
-/* internal MDIO read and write wrappers, mutex must be locked by the caller */
-static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
+/* MDIO read and write wrappers for phylib */
+
+/* __lan78xx_mdiobus_read() - perform one Clause-22 MII read
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference. Split out so the
+ * Clause-45 helpers below can issue several accesses under a single lock.
+ */
+static int __lan78xx_mdiobus_read(struct lan78xx_net *dev, int phy_id, int idx)
 {
-	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
@@ -1996,14 +2015,16 @@ static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 	if (ret < 0)
 		return ret;
 
-	ret = (int)(val & 0xFFFF);
-	return ret;
+	return (int)(val & 0xFFFF);
 }
 
-static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
-				 u16 regval)
+/* __lan78xx_mdiobus_write() - perform one Clause-22 MII write
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference.
+ */
+static int __lan78xx_mdiobus_write(struct lan78xx_net *dev, int phy_id, int idx,
+				   u16 regval)
 {
-	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
@@ -2023,12 +2044,10 @@ static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 	if (ret < 0)
 		return ret;
 
-	ret = lan78xx_phy_wait_not_busy(dev);
-	return ret;
+	return lan78xx_phy_wait_not_busy(dev);
 }
 
-/* MDIO read and write wrappers for phylib */
-static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
+static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
 	int ret;
@@ -2038,15 +2057,15 @@ static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
 		return ret;
 
 	mutex_lock(&dev->phy_mutex);
-	ret = lan78xx_mdiobus_read(bus, phy_id, idx);
-
+	ret = __lan78xx_mdiobus_read(dev, phy_id, idx);
 	mutex_unlock(&dev->phy_mutex);
+
 	usb_autopm_put_interface(dev->intf);
 
 	return ret;
 }
 
-static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
+static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 				 u16 regval)
 {
 	struct lan78xx_net *dev = bus->priv;
@@ -2057,19 +2076,51 @@ static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
 		return ret;
 
 	mutex_lock(&dev->phy_mutex);
-
-	ret = lan78xx_mdiobus_write(bus, phy_id, idx, regval);
-
+	ret = __lan78xx_mdiobus_write(dev, phy_id, idx, regval);
 	mutex_unlock(&dev->phy_mutex);
+
 	usb_autopm_put_interface(dev->intf);
+
 	return ret;
 }
 
-static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
-						 int phy_id, int devad, int idx)
+/* lan78xx_mmd_indirect_setup() - point the Clause-22 MMD access registers at a
+ * Clause-45 device/register, leaving the controller ready for a data access.
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference.
+ *
+ * The LAN78xx MAC only exposes a Clause-22 MDIO controller, so Clause-45
+ * register space (used by BASE-T1 PHYs such as the Broadcom BCM89881 on the
+ * dissecto HydraLink) is reached through the standard MMD indirection
+ * registers MII_MMD_CTRL / MII_MMD_DATA.
+ */
+static int lan78xx_mmd_indirect_setup(struct lan78xx_net *dev, int phy_id,
+				      int devad, int idx)
 {
 	int ret;
+
+	/* select function = address, then write the register address */
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_CTRL,
+				      MII_MMD_CTRL_ADDR |
+				      (devad & MII_MMD_CTRL_DEVAD_MASK));
+	if (ret < 0)
+		return ret;
+
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_DATA, idx);
+	if (ret < 0)
+		return ret;
+
+	/* select function = data (no post-increment) for the same devad */
+	return __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_CTRL,
+				       MII_MMD_CTRL_NOINCR |
+				       (devad & MII_MMD_CTRL_DEVAD_MASK));
+}
+
+static int lan78xx_mdiobus_read_c45(struct mii_bus *bus, int phy_id, int devad,
+				    int idx)
+{
 	struct lan78xx_net *dev = bus->priv;
+	int ret;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -2077,29 +2128,24 @@ static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 
 	mutex_lock(&dev->phy_mutex);
 
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
+	ret = lan78xx_mmd_indirect_setup(dev, phy_id, devad, idx);
 	if (ret < 0)
 		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
+
+	ret = __lan78xx_mdiobus_read(dev, phy_id, MII_MMD_DATA);
 
 done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
+
 	return ret;
 }
 
-static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
-						  int phy_id, int devad,
-						  int idx, u16 val)
+static int lan78xx_mdiobus_write_c45(struct mii_bus *bus, int phy_id, int devad,
+				     int idx, u16 regval)
 {
-	int ret;
 	struct lan78xx_net *dev = bus->priv;
+	int ret;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -2107,21 +2153,17 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 
 	mutex_lock(&dev->phy_mutex);
 
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
+	ret = lan78xx_mmd_indirect_setup(dev, phy_id, devad, idx);
 	if (ret < 0)
 		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
+
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_DATA, regval);
 
 done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
-	return 0;
+
+	return ret;
 }
 
 static int lan78xx_mdio_init(struct lan78xx_net *dev)
@@ -2136,8 +2178,11 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	}
 
 	dev->mdiobus->priv = (void *)dev;
-	dev->mdiobus->read = lan78xx_mdiobus_read_c22;
-	dev->mdiobus->write = lan78xx_mdiobus_write_c22;
+	dev->mdiobus->read = lan78xx_mdiobus_read;
+	dev->mdiobus->write = lan78xx_mdiobus_write;
+	/* Clause-45 access (via MMD indirection) is required for BASE-T1 PHYs
+	 * such as the Broadcom BCM89881 on the dissecto HydraLink.
+	 */
 	dev->mdiobus->read_c45 = lan78xx_mdiobus_read_c45;
 	dev->mdiobus->write_c45 = lan78xx_mdiobus_write_c45;
 	dev->mdiobus->name = "lan78xx-mdiobus";
@@ -2270,13 +2315,10 @@ static struct irq_chip lan78xx_irqchip = {
 
 static int lan78xx_setup_irq_domain(struct lan78xx_net *dev)
 {
-	struct device_node *of_node;
 	struct irq_domain *irqdomain;
 	unsigned int irqmap = 0;
 	u32 buf;
 	int ret = 0;
-
-	of_node = dev->udev->dev.parent->of_node;
 
 	mutex_init(&dev->domain_data.irq_lock);
 
@@ -2286,8 +2328,9 @@ static int lan78xx_setup_irq_domain(struct lan78xx_net *dev)
 	dev->domain_data.irqchip = &lan78xx_irqchip;
 	dev->domain_data.irq_handler = handle_simple_irq;
 
-	irqdomain = irq_domain_add_simple(of_node, MAX_INT_EP, 0,
-					  &chip_domain_ops, &dev->domain_data);
+	irqdomain = irq_domain_create_simple(dev_fwnode(dev->udev->dev.parent),
+					     MAX_INT_EP, 0, &chip_domain_ops,
+					     &dev->domain_data);
 	if (irqdomain) {
 		/* create mapping for PHY interrupt */
 		irqmap = irq_create_mapping(irqdomain, INT_EP_PHY);
@@ -2373,7 +2416,7 @@ static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 	phydev = phy_find_first(dev->mdiobus);
 	if (!phydev) {
 		netdev_dbg(dev->net, "PHY Not Found!! Registering Fixed PHY\n");
-		phydev = fixed_phy_register(PHY_POLL, &fphy_status, NULL);
+		phydev = fixed_phy_register(&fphy_status, NULL);
 		if (IS_ERR(phydev)) {
 			netdev_err(dev->net, "No PHY/fixed_PHY found\n");
 			return NULL;
@@ -2678,10 +2721,7 @@ static int lan78xx_set_features(struct net_device *netdev,
 	else
 		pdata->rfe_ctl &= ~RFE_CTL_VLAN_STRIP_;
 
-	if (features & NETIF_F_HW_VLAN_CTAG_FILTER)
-		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
-	else
-		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
+	lan78xx_update_vlan_filter(pdata, netdev, features);
 
 	spin_unlock_irqrestore(&pdata->rfe_ctl_lock, flags);
 
@@ -3282,7 +3322,7 @@ static int lan78xx_stop(struct net_device *net)
 	mutex_lock(&dev->dev_mutex);
 
 	if (timer_pending(&dev->stat_monitor))
-		del_timer_sync(&dev->stat_monitor);
+		timer_delete_sync(&dev->stat_monitor);
 
 	clear_bit(EVENT_DEV_OPEN, &dev->flags);
 	netif_stop_queue(net);
@@ -4398,7 +4438,7 @@ static const struct net_device_ops lan78xx_netdev_ops = {
 
 static void lan78xx_stat_monitor(struct timer_list *t)
 {
-	struct lan78xx_net *dev = from_timer(dev, t, stat_monitor);
+	struct lan78xx_net *dev = container_of(t, struct lan78xx_net, stat_monitor);
 
 	lan78xx_defer_kevent(dev, EVENT_STAT_UPDATE);
 }
@@ -4918,7 +4958,7 @@ static int lan78xx_suspend(struct usb_interface *intf, pm_message_t message)
 		/* reattach */
 		netif_device_attach(dev->net);
 
-		del_timer(&dev->stat_monitor);
+		timer_delete(&dev->stat_monitor);
 
 		if (PMSG_IS_AUTO(message)) {
 			ret = lan78xx_set_auto_suspend(dev);
