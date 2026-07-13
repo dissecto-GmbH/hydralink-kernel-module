@@ -28,6 +28,7 @@
 #include <linux/phy_fixed.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
+#include <linux/timer.h>
 #include "lan78xx.h"
 
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
@@ -1264,6 +1265,17 @@ static void lan78xx_deferred_multicast_write(struct work_struct *param)
 	lan78xx_write_reg(dev, RFE_CTL, pdata->rfe_ctl);
 }
 
+static void lan78xx_update_vlan_filter(struct lan78xx_priv *pdata,
+				       struct net_device *netdev,
+				       netdev_features_t features)
+{
+	if ((features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+	    !(netdev->flags & IFF_PROMISC))
+		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
+	else
+		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
+}
+
 static void lan78xx_set_multicast(struct net_device *netdev)
 {
 	struct lan78xx_net *dev = netdev_priv(netdev);
@@ -1297,6 +1309,8 @@ static void lan78xx_set_multicast(struct net_device *netdev)
 			pdata->rfe_ctl |= RFE_CTL_MCAST_EN_;
 		}
 	}
+
+	lan78xx_update_vlan_filter(pdata, dev->net, dev->net->features);
 
 	if (netdev_mc_count(dev->net)) {
 		struct netdev_hw_addr *ha;
@@ -1970,10 +1984,15 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 	eth_hw_addr_set(dev->net, addr);
 }
 
-/* internal MDIO read and write wrappers, mutex must be locked by the caller */
-static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
+/* MDIO read and write wrappers for phylib */
+
+/* __lan78xx_mdiobus_read() - perform one Clause-22 MII read
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference. Split out so the
+ * Clause-45 helpers below can issue several accesses under a single lock.
+ */
+static int __lan78xx_mdiobus_read(struct lan78xx_net *dev, int phy_id, int idx)
 {
-	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
@@ -1996,14 +2015,16 @@ static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 	if (ret < 0)
 		return ret;
 
-	ret = (int)(val & 0xFFFF);
-	return ret;
+	return (int)(val & 0xFFFF);
 }
 
-static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
-				 u16 regval)
+/* __lan78xx_mdiobus_write() - perform one Clause-22 MII write
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference.
+ */
+static int __lan78xx_mdiobus_write(struct lan78xx_net *dev, int phy_id, int idx,
+				   u16 regval)
 {
-	struct lan78xx_net *dev = bus->priv;
 	u32 val, addr;
 	int ret;
 
@@ -2023,12 +2044,10 @@ static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 	if (ret < 0)
 		return ret;
 
-	ret = lan78xx_phy_wait_not_busy(dev);
-	return ret;
+	return lan78xx_phy_wait_not_busy(dev);
 }
 
-/* MDIO read and write wrappers for phylib */
-static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
+static int lan78xx_mdiobus_read(struct mii_bus *bus, int phy_id, int idx)
 {
 	struct lan78xx_net *dev = bus->priv;
 	int ret;
@@ -2038,15 +2057,15 @@ static int lan78xx_mdiobus_read_c22(struct mii_bus *bus, int phy_id, int idx)
 		return ret;
 
 	mutex_lock(&dev->phy_mutex);
-	ret = lan78xx_mdiobus_read(bus, phy_id, idx);
-
+	ret = __lan78xx_mdiobus_read(dev, phy_id, idx);
 	mutex_unlock(&dev->phy_mutex);
+
 	usb_autopm_put_interface(dev->intf);
 
 	return ret;
 }
 
-static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
+static int lan78xx_mdiobus_write(struct mii_bus *bus, int phy_id, int idx,
 				 u16 regval)
 {
 	struct lan78xx_net *dev = bus->priv;
@@ -2057,19 +2076,51 @@ static int lan78xx_mdiobus_write_c22(struct mii_bus *bus, int phy_id, int idx,
 		return ret;
 
 	mutex_lock(&dev->phy_mutex);
-
-	ret = lan78xx_mdiobus_write(bus, phy_id, idx, regval);
-
+	ret = __lan78xx_mdiobus_write(dev, phy_id, idx, regval);
 	mutex_unlock(&dev->phy_mutex);
+
 	usb_autopm_put_interface(dev->intf);
+
 	return ret;
 }
 
-static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
-						 int phy_id, int devad, int idx)
+/* lan78xx_mmd_indirect_setup() - point the Clause-22 MMD access registers at a
+ * Clause-45 device/register, leaving the controller ready for a data access.
+ *
+ * Caller must hold dev->phy_mutex and an autopm reference.
+ *
+ * The LAN78xx MAC only exposes a Clause-22 MDIO controller, so Clause-45
+ * register space (used by BASE-T1 PHYs such as the Broadcom BCM89881 on the
+ * dissecto HydraLink) is reached through the standard MMD indirection
+ * registers MII_MMD_CTRL / MII_MMD_DATA.
+ */
+static int lan78xx_mmd_indirect_setup(struct lan78xx_net *dev, int phy_id,
+				      int devad, int idx)
 {
 	int ret;
+
+	/* select function = address, then write the register address */
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_CTRL,
+				      MII_MMD_CTRL_ADDR |
+				      (devad & MII_MMD_CTRL_DEVAD_MASK));
+	if (ret < 0)
+		return ret;
+
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_DATA, idx);
+	if (ret < 0)
+		return ret;
+
+	/* select function = data (no post-increment) for the same devad */
+	return __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_CTRL,
+				       MII_MMD_CTRL_NOINCR |
+				       (devad & MII_MMD_CTRL_DEVAD_MASK));
+}
+
+static int lan78xx_mdiobus_read_c45(struct mii_bus *bus, int phy_id, int devad,
+				    int idx)
+{
 	struct lan78xx_net *dev = bus->priv;
+	int ret;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -2077,29 +2128,24 @@ static int lan78xx_mdiobus_read_c45(struct mii_bus *bus,
 
 	mutex_lock(&dev->phy_mutex);
 
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
+	ret = lan78xx_mmd_indirect_setup(dev, phy_id, devad, idx);
 	if (ret < 0)
 		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_read(bus, phy_id, MII_MMD_DATA);
+
+	ret = __lan78xx_mdiobus_read(dev, phy_id, MII_MMD_DATA);
 
 done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
+
 	return ret;
 }
 
-static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
-						  int phy_id, int devad,
-						  int idx, u16 val)
+static int lan78xx_mdiobus_write_c45(struct mii_bus *bus, int phy_id, int devad,
+				     int idx, u16 regval)
 {
-	int ret;
 	struct lan78xx_net *dev = bus->priv;
+	int ret;
 
 	ret = usb_autopm_get_interface(dev->intf);
 	if (ret < 0)
@@ -2107,21 +2153,17 @@ static int lan78xx_mdiobus_write_c45(struct mii_bus *bus,
 
 	mutex_lock(&dev->phy_mutex);
 
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x0000 | devad);
+	ret = lan78xx_mmd_indirect_setup(dev, phy_id, devad, idx);
 	if (ret < 0)
 		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, idx);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_CTRL, 0x4000 | devad);
-	if (ret < 0)
-		goto done;
-	ret = lan78xx_mdiobus_write(bus, phy_id, MII_MMD_DATA, val);
+
+	ret = __lan78xx_mdiobus_write(dev, phy_id, MII_MMD_DATA, regval);
 
 done:
 	mutex_unlock(&dev->phy_mutex);
 	usb_autopm_put_interface(dev->intf);
-	return 0;
+
+	return ret;
 }
 
 static int lan78xx_mdio_init(struct lan78xx_net *dev)
@@ -2136,8 +2178,11 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 	}
 
 	dev->mdiobus->priv = (void *)dev;
-	dev->mdiobus->read = lan78xx_mdiobus_read_c22;
-	dev->mdiobus->write = lan78xx_mdiobus_write_c22;
+	dev->mdiobus->read = lan78xx_mdiobus_read;
+	dev->mdiobus->write = lan78xx_mdiobus_write;
+	/* Clause-45 access (via MMD indirection) is required for BASE-T1 PHYs
+	 * such as the Broadcom BCM89881 on the dissecto HydraLink.
+	 */
 	dev->mdiobus->read_c45 = lan78xx_mdiobus_read_c45;
 	dev->mdiobus->write_c45 = lan78xx_mdiobus_write_c45;
 	dev->mdiobus->name = "lan78xx-mdiobus";
@@ -2678,10 +2723,7 @@ static int lan78xx_set_features(struct net_device *netdev,
 	else
 		pdata->rfe_ctl &= ~RFE_CTL_VLAN_STRIP_;
 
-	if (features & NETIF_F_HW_VLAN_CTAG_FILTER)
-		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
-	else
-		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
+	lan78xx_update_vlan_filter(pdata, netdev, features);
 
 	spin_unlock_irqrestore(&pdata->rfe_ctl_lock, flags);
 
@@ -5165,6 +5207,7 @@ static struct usb_driver lan78xx_driver = {
 
 module_usb_driver(lan78xx_driver);
 
+MODULE_SOFTDEP("pre: bcm89881");
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
