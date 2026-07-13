@@ -2,7 +2,44 @@
 
 This allows you to use HydraLink without the python utility, configuring it using ethtool instead.
 
+## Which branch should I use?
+
+The out-of-tree module tracks upstream Linux API changes across several kernel generations. **You must pick the branch that matches the kernel you are building against** (the one from `uname -r`), not the newest branch.
+
+### Check your kernel version
+
+```bash
+uname -r
+# Example output: 6.18.33-1-lts
+```
+
+Use the **major.minor** part (e.g. `6.18` → use `release`; `6.12` → use `release-v6.11`; `6.8` → use `release-v6.8`).
+
+### Pick the matching branch
+
+| Your kernel (`uname -r`) | Branch to checkout | Typical environments |
+|--------------------------|-------------------|----------------------|
+| **6.15 and newer** (6.15, 6.16, 6.18, …) | `release` | Current Arch, Fedora, dissectos / Raspberry Pi OS on recent kernels |
+| **6.11 – 6.14** | `release-v6.11` | Older rolling/stable distros still on 6.12 LTS |
+| **6.8 – 6.10** | `release-v6.8` | Legacy LTS systems, older embedded images |
+
+```bash
+# After cloning, checkout exactly one branch:
+git checkout release          # kernel 6.15+
+# git checkout release-v6.11  # kernel 6.11 – 6.14
+# git checkout release-v6.8   # kernel 6.8 – 6.10
+```
+
+### Quick examples
+
+| `uname -r` | Command |
+|------------|---------|
+| `6.18.36-v8-16k-dissectos` | `git checkout release` |
+| `6.12.27-1-lts` | `git checkout release-v6.11` |
+| `6.8.0-58-generic` | `git checkout release-v6.8` |
+
 ## Download sources and prerequisites
+
 ```bash
 # Install prerequisites (ubuntu, may be different on other distros)
 sudo apt install linux-headers-$(uname -r) build-essential
@@ -11,19 +48,12 @@ sudo apt install linux-headers-$(uname -r) build-essential
 git clone https://github.com/dissecto-GmbH/hydralink-kernel-module.git
 cd hydralink-kernel-module
 
-# Optionally, checkout the appropriate branch for your kernel
-#git checkout release-v6.8
-```
-
-The `release` branch is compatible with updated versions of the Linux kernel (6.11 and above).
-
-If you are using an older kernel, checkout the appropriate branch:
-
-```bash
+# Checkout the branch for your kernel (see table above)
 git checkout release-v6.8
 ```
 
 ## Build
+
 ```bash
 # Compile the kernel modules
 make
@@ -39,7 +69,7 @@ cd ..
 sudo rmmod lan78xx
 sudo rmmod hydralink
 sudo rmmod bcm89881
-# Load the modules we just compile
+# Load the modules we just compiled
 sudo insmod phy_driver/bcm89881.ko
 sudo insmod hydralink.ko
 ```
